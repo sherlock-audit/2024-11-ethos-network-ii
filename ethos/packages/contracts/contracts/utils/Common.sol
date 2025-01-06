@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 pragma solidity 0.8.26;
+error IndexOutOfBounds();
 
 contract Common {
   /**
@@ -30,8 +31,9 @@ contract Common {
    * @param array The storage array to modify
    * @notice This function will revert if the index is out of bounds
    */
+
   function _removeFromArray(uint256 index, address[] storage array) internal {
-    require(index < array.length, "Index out of bounds");
+    if (index >= array.length) revert IndexOutOfBounds();
 
     // If this is not the last element, copy last element to the index position
     if (index != array.length - 1) {

@@ -14,14 +14,9 @@ error MarketCreationUnauthorized(
   uint256 profileId
 );
 error InsufficientFunds();
-error InsufficientInitialLiquidity();
+error InsufficientLiquidity(uint256 creationCost);
 error InsufficientVotesOwned(uint256 profileId, address addressStr);
 error InsufficientVotesToSell(uint256 profileId);
-error SlippageLimitExceeded(
-  uint256 votesBought,
-  uint256 expectedVotes,
-  uint256 slippageBasisPoints
-);
 error InvalidMarketConfigOption(string message);
 error FeeTransferFailed(string message);
 error InactiveMarket(uint256 profileId);
@@ -30,3 +25,4 @@ error UnauthorizedWithdrawal();
 error MarketNotGraduated();
 error NoFundsToWithdraw();
 error ZeroAddressNotAllowed();
+error SellSlippageLimitExceeded(uint256 minimumPricePerVote, uint256 actualPricePerVote);
