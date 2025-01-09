@@ -46,7 +46,11 @@ describe('EthosVouch Vouching by Address', () => {
   });
 
   it('should successfully vouch for a valid profile address', async () => {
-    await userA.vouch(userB);
+    await ethosVouch
+      .connect(userA.signer)
+      .vouchByAddress(userB.signer.address, DEFAULT.COMMENT, DEFAULT.METADATA, {
+        value: DEFAULT.PAYMENT_AMOUNT,
+      });
 
     // Verify the vouch was created
     const vouch = await ethosVouch.verifiedVouchByAuthorForSubjectProfileId(
@@ -55,6 +59,8 @@ describe('EthosVouch Vouching by Address', () => {
     );
     expect(vouch.authorProfileId).to.equal(userA.profileId);
     expect(vouch.subjectProfileId).to.equal(userB.profileId);
+    expect(vouch.comment).to.equal(DEFAULT.COMMENT);
+    expect(vouch.metadata).to.equal(DEFAULT.METADATA);
   });
 
   it('should create a vouch using vouchByAddress', async () => {
@@ -97,6 +103,7 @@ describe('EthosVouch Profile Status Tests', () => {
   let mockProfileByAddress: EthosUser;
   let mockProfileByAttestation: EthosUser;
   let archivedProfileUser: EthosUser;
+  let mockAttestationHash: string;
 
   beforeEach(async () => {
     deployer = await loadFixture(createDeployer);
@@ -109,7 +116,7 @@ describe('EthosVouch Profile Status Tests', () => {
       attestationDetails: { account: DEFAULT.ACCOUNT_NAME_EXAMPLE, service: DEFAULT.SERVICE_X },
     });
     // get the profile id of the mock profile by attestation
-    const mockAttestationHash = await common.attestationHash(
+    mockAttestationHash = await common.attestationHash(
       DEFAULT.ACCOUNT_NAME_EXAMPLE,
       DEFAULT.SERVICE_X,
     );
@@ -140,7 +147,11 @@ describe('EthosVouch Profile Status Tests', () => {
   });
 
   it('should allow vouching for a mock profile created via address review', async () => {
-    await userA.vouch(mockProfileByAddress);
+    await ethosVouch
+      .connect(userA.signer)
+      .vouchByAddress(mockProfileByAddress.signer.address, DEFAULT.COMMENT, DEFAULT.METADATA, {
+        value: DEFAULT.PAYMENT_AMOUNT,
+      });
 
     const vouch = await ethosVouch.verifiedVouchByAuthorForSubjectProfileId(
       userA.profileId,
@@ -167,8 +178,11 @@ describe('EthosVouch Profile Status Tests', () => {
 
   it('should handle profile transitions from mock to verified for mocks created via address review', async () => {
     // First vouch for mock profile
-    await userA.vouch(mockProfileByAddress);
-
+    await ethosVouch
+      .connect(userA.signer)
+      .vouchByAddress(mockProfileByAddress.signer.address, DEFAULT.COMMENT, DEFAULT.METADATA, {
+        value: DEFAULT.PAYMENT_AMOUNT,
+      });
     // Verify the mock profile by creating a real profile
     await deployer.ethosProfile.contract
       ?.connect(deployer.OWNER)
@@ -191,7 +205,11 @@ describe('EthosVouch Profile Status Tests', () => {
   });
 
   it('should allow vouching for a mock profile created via attestation review', async () => {
-    await userA.vouch(mockProfileByAttestation);
+    await ethosVouch
+      .connect(userA.signer)
+      .vouchByAttestation(mockAttestationHash, DEFAULT.COMMENT, DEFAULT.METADATA, {
+        value: DEFAULT.PAYMENT_AMOUNT,
+      });
 
     const vouch = await ethosVouch.verifiedVouchByAuthorForSubjectProfileId(
       userA.profileId,
@@ -203,7 +221,11 @@ describe('EthosVouch Profile Status Tests', () => {
 
   it('should handle profile transitions from mock to verified for mocks created via attestation review', async () => {
     // First vouch for mock profile
-    await userA.vouch(mockProfileByAttestation);
+    await ethosVouch
+      .connect(userA.signer)
+      .vouchByAttestation(mockAttestationHash, DEFAULT.COMMENT, DEFAULT.METADATA, {
+        value: DEFAULT.PAYMENT_AMOUNT,
+      });
 
     // Verify the mock profile by creating a real profile
     await deployer.ethosProfile.contract
@@ -211,10 +233,10 @@ describe('EthosVouch Profile Status Tests', () => {
       .inviteAddress(mockProfileByAttestation.signer.address);
     await deployer.ethosProfile.contract?.connect(mockProfileByAttestation.signer).createProfile(1);
 
-    // Because the original vouch is still there, another vouch should fail
+    // Because the user now has a new profileId, vouching for the old profileId should fail
     await expect(userA.vouch(mockProfileByAttestation)).to.be.revertedWithCustomError(
       deployer.ethosVouch.contract,
-      'AlreadyVouched',
+      'InvalidEthosProfileForVouch',
     );
 
     const vouch = await ethosVouch.verifiedVouchByAuthorForSubjectProfileId(

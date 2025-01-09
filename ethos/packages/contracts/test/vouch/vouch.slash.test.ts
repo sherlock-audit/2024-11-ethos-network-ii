@@ -136,4 +136,62 @@ describe('EthosVouch Slashing', () => {
     // Should reduce balance by 0.01%
     expect(finalBalance.balance).to.equal((initialBalance.balance * 9999n) / 10000n);
   });
+
+  describe('Frozen Authors', () => {
+    let vouchId: bigint;
+
+    beforeEach(async () => {
+      const vouch = await ethosVouch.verifiedVouchByAuthorForSubjectProfileId(
+        userA.profileId,
+        userB.profileId,
+      );
+      vouchId = vouch.vouchId;
+    });
+
+    it('should prevent withdrawals when author is frozen', async () => {
+      await ethosVouch.connect(slasher.signer).freeze(userA.profileId);
+
+      await expect(ethosVouch.connect(userA.signer).unvouch(vouchId))
+        .to.be.revertedWithCustomError(ethosVouch, 'PendingSlash')
+        .withArgs(vouchId, userA.profileId);
+    });
+
+    it('should allow withdrawals after unfreezing', async () => {
+      await ethosVouch.connect(slasher.signer).freeze(userA.profileId);
+      await ethosVouch.connect(slasher.signer).unfreeze(userA.profileId);
+
+      await expect(ethosVouch.connect(userA.signer).unvouch(vouchId))
+        .to.emit(ethosVouch, 'Unvouched')
+        .withArgs(vouchId, userA.profileId, userB.profileId, VOUCH_PARAMS.paymentAmount);
+    });
+
+    it('should allow withdrawals for non-frozen authors', async () => {
+      await ethosVouch.connect(slasher.signer).freeze(userA.profileId);
+
+      // userB should still be able to unvouch even though userA is frozen
+      const userBVouch = await userB.vouch(userA);
+      await expect(ethosVouch.connect(userB.signer).unvouch(userBVouch.vouchId))
+        .to.emit(ethosVouch, 'Unvouched')
+        .withArgs(userBVouch.vouchId, userB.profileId, userA.profileId, VOUCH_PARAMS.paymentAmount);
+    });
+
+    it('should maintain frozen status after slashing', async () => {
+      await ethosVouch.connect(slasher.signer).freeze(userA.profileId);
+      await ethosVouch.connect(slasher.signer).slash(userA.profileId, 1000n); // 10% slash
+
+      await expect(ethosVouch.connect(userA.signer).unvouch(vouchId))
+        .to.be.revertedWithCustomError(ethosVouch, 'PendingSlash')
+        .withArgs(vouchId, userA.profileId);
+    });
+
+    it('should emit Frozen event when freezing and unfreezing', async () => {
+      await expect(ethosVouch.connect(slasher.signer).freeze(userA.profileId))
+        .to.emit(ethosVouch, 'Frozen')
+        .withArgs(userA.profileId, true);
+
+      await expect(ethosVouch.connect(slasher.signer).unfreeze(userA.profileId))
+        .to.emit(ethosVouch, 'Frozen')
+        .withArgs(userA.profileId, false);
+    });
+  });
 });

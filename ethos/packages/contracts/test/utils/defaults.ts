@@ -1,9 +1,10 @@
 import hre from 'hardhat';
-import { type Address, zeroAddress } from 'viem';
+import { zeroAddress } from 'viem';
 
 const { ethers } = hre;
 
-export const MAX_TOTAL_FEES = 10000n;
+// 10000 basis points * 10/100 (10% max fees)
+export const MAX_TOTAL_FEES = (10000n * 10n) / 100n;
 
 export const DEFAULT = {
   COMMENT: 'default comment',
@@ -16,21 +17,25 @@ export const DEFAULT = {
   ACCOUNT_NAME_EXAMPLE: 'example',
   ATTESTATION_EVIDENCE_0: 'ATTESTATION_EVIDENCE_0',
   ATTESTATION_EVIDENCE_1: 'ATTESTATION_EVIDENCE_1',
+  ATTESTATION_EVIDENCE: JSON.stringify({
+    source: 'privy',
+    type: 'OAuth2',
+    id: 'privyLogin.id',
+    approver: 'ethos.network',
+  }),
   ATTESTATION_HASH: '0x0000000000000000000000000000000000000000000000000000000000000000',
   PAYMENT_TOKEN: zeroAddress,
   PAYMENT_AMOUNT: ethers.parseEther('0.1'),
   PROVIDER: ethers.provider,
   EMPTY_BYTES: '0x' + '0'.repeat(64),
-};
+} as const;
 
 export type VouchParams = {
-  paymentToken?: Address;
   paymentAmount?: bigint;
   comment?: string;
   metadata?: string;
 };
 export const VOUCH_PARAMS = {
-  paymentToken: DEFAULT.PAYMENT_TOKEN,
   paymentAmount: DEFAULT.PAYMENT_AMOUNT,
   comment: DEFAULT.COMMENT,
   metadata: DEFAULT.METADATA,

@@ -109,6 +109,50 @@ export function calculateFee(
   return { deposit, fee };
 }
 
+/**
+ * Calculates fees and their proportional distribution based on basis points
+ * @param amount The amount to calculate fees for
+ * @param feeBasisPoints The basis points for each fee type
+ * @returns Object containing total fees, deposit amount, and fee shares
+ */
+export function calcFeeDistribution(
+  amount: bigint,
+  feeBasisPoints: {
+    entry: bigint;
+    donation: bigint;
+    vouchIncentives: bigint;
+  },
+): {
+  totalFees: bigint;
+  deposit: bigint;
+  shares: { protocol: bigint; donation: bigint; vouchersPool: bigint };
+} {
+  // Calculate total basis points for all fees
+  const totalBasisPoints =
+    feeBasisPoints.entry + feeBasisPoints.donation + feeBasisPoints.vouchIncentives;
+
+  // If total basis points is 0, return 0 fees; don't divide by 0
+  if (totalBasisPoints === 0n) {
+    return {
+      totalFees: 0n,
+      deposit: amount,
+      shares: { protocol: 0n, donation: 0n, vouchersPool: 0n },
+    };
+  }
+  // Calculate total fees using combined basis points
+  const totalFees = amount - (amount * 10000n) / (10000n + totalBasisPoints);
+
+  return {
+    totalFees,
+    deposit: amount - totalFees,
+    shares: {
+      protocol: (totalFees * feeBasisPoints.entry) / totalBasisPoints,
+      donation: (totalFees * feeBasisPoints.donation) / totalBasisPoints,
+      vouchersPool: (totalFees * feeBasisPoints.vouchIncentives) / totalBasisPoints,
+    },
+  };
+}
+
 export function mulDivFloor(amount: bigint, numerator: bigint, denominator: bigint): bigint {
   // Replicate Solidity's mulDiv with floor rounding
   return (amount * numerator) / denominator;

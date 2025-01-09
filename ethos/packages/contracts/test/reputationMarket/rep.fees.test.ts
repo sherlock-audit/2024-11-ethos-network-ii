@@ -42,7 +42,7 @@ describe('ReputationMarket Fees', () => {
     await reputationMarket
       .connect(deployer.ADMIN)
       .createMarketWithConfigAdmin(userA.signer.address, 0, {
-        value: DEFAULT.initialLiquidity,
+        value: DEFAULT.creationCost,
       });
   });
 
@@ -93,8 +93,8 @@ describe('ReputationMarket Fees', () => {
       await reputationMarket.connect(deployer.ADMIN).setEntryProtocolFeeBasisPoints(entryFee);
       await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
       const { simulatedFundsPaid: withFeesPayment } = await userA.simulateBuy();
-      const expectedProtocolFee = (DEFAULT.buyAmount * BigInt(entryFee)) / BASIS_POINTS;
-      const expectedDonation = (DEFAULT.buyAmount * BigInt(donationFee)) / BASIS_POINTS;
+      const expectedProtocolFee = (noFeesPayment * BigInt(entryFee)) / BASIS_POINTS;
+      const expectedDonation = (noFeesPayment * BigInt(donationFee)) / BASIS_POINTS;
       const expectedFunds = noFeesPayment + expectedProtocolFee + expectedDonation;
       expect(withFeesPayment).to.equal(expectedFunds);
     });
@@ -146,9 +146,34 @@ describe('ReputationMarket Fees', () => {
       );
     });
 
+    it('should allocate funds minus fees to the market when buying votes', async () => {
+      const marketFundsBefore = await reputationMarket
+        .connect(deployer.ADMIN)
+        .marketFunds(DEFAULT.profileId);
+      const protocolFeeBalanceBefore = await ethers.provider.getBalance(protocolFeeAddress);
+      await reputationMarket.connect(deployer.ADMIN).setEntryProtocolFeeBasisPoints(entryFee);
+      await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
+      const { fundsPaid } = await userA.buyVotes();
+      const protocolFeeBalanceAfter = await ethers.provider.getBalance(protocolFeeAddress);
+      const protocolFeeReceived = protocolFeeBalanceAfter - protocolFeeBalanceBefore;
+      const donationRecipient = await reputationMarket.donationRecipient(DEFAULT.profileId);
+      const donationEscrowReceived = await reputationMarket.donationEscrow(donationRecipient);
+      const marketFundsAfter = await reputationMarket
+        .connect(deployer.ADMIN)
+        .marketFunds(DEFAULT.profileId);
+
+      if (!fundsPaid) {
+        throw new Error('Funds paid is undefined');
+      }
+
+      expect(marketFundsAfter).to.equal(
+        marketFundsBefore + (fundsPaid - donationEscrowReceived - protocolFeeReceived),
+      );
+    });
+
     it('should correctly apply exit fees when selling votes', async () => {
       await reputationMarket.connect(deployer.ADMIN).setExitProtocolFeeBasisPoints(exitFee);
-      const { fundsPaid } = await userA.buyVotes();
+      const { fundsPaid } = await userA.buyVotes({ votesToBuy: 1n });
       const { fundsReceived } = await userA.sellVotes({ sellVotes: 1n });
 
       if (!fundsPaid) {
@@ -158,7 +183,26 @@ describe('ReputationMarket Fees', () => {
       expect(fundsReceived).to.equal(fundsPaid - expectedProtocolFee);
     });
 
+    it('should correctly adjust market funds after selling votes', async () => {
+      await reputationMarket.connect(deployer.ADMIN).setExitProtocolFeeBasisPoints(exitFee);
+      const { fundsPaid } = await userA.buyVotes({ votesToBuy: 1n });
+
+      const marketFundsBefore = await reputationMarket.marketFunds(DEFAULT.profileId);
+      const { fundsReceived } = await userA.sellVotes({ sellVotes: 1n });
+
+      if (!fundsReceived || !fundsPaid) {
+        throw new Error('Funds paid is undefined');
+      }
+      const marketFundsAfter = await reputationMarket.marketFunds(DEFAULT.profileId);
+
+      const expectedExitFee = (fundsPaid * BigInt(exitFee)) / BASIS_POINTS;
+      const expectedMarketFunds = marketFundsBefore - fundsReceived - expectedExitFee;
+
+      expect(marketFundsAfter).to.equal(expectedMarketFunds);
+    });
+
     it('should transfer protocol fees to the designated address', async () => {
+      const { simulatedFundsPaid: singleVotePrice } = await userA.simulateBuy({ votesToBuy: 1n });
       await reputationMarket.connect(deployer.ADMIN).setEntryProtocolFeeBasisPoints(entryFee);
 
       const newFeeAddress = ethers.Wallet.createRandom().address;
@@ -166,25 +210,25 @@ describe('ReputationMarket Fees', () => {
 
       const initialFeeBalance = await ethers.provider.getBalance(newFeeAddress);
 
-      await userA.buyVotes();
+      await userA.buyVotes({ votesToBuy: 1n });
 
       const finalFeeBalance = await ethers.provider.getBalance(newFeeAddress);
       const feeReceived = finalFeeBalance - initialFeeBalance;
-
-      const expectedProtocolFee = (DEFAULT.buyAmount * BigInt(entryFee)) / BASIS_POINTS;
+      const expectedProtocolFee = (BigInt(singleVotePrice) * BigInt(entryFee)) / BASIS_POINTS;
 
       expect(feeReceived).to.equal(expectedProtocolFee);
     });
 
     it('should accumulate donations in the donation escrow', async () => {
+      const { simulatedFundsPaid: singleVotePrice } = await userA.simulateBuy({ votesToBuy: 1n });
       await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
 
-      await userA.buyVotes();
+      await userA.buyVotes({ votesToBuy: 1n });
 
       const donationRecipient = await reputationMarket.donationRecipient(DEFAULT.profileId);
       const donationEscrow = await reputationMarket.donationEscrow(donationRecipient);
 
-      const expectedDonation = (DEFAULT.buyAmount * BigInt(donationFee)) / BASIS_POINTS;
+      const expectedDonation = (BigInt(singleVotePrice) * BigInt(donationFee)) / BASIS_POINTS;
 
       expect(donationEscrow).to.equal(expectedDonation);
     });
@@ -192,31 +236,56 @@ describe('ReputationMarket Fees', () => {
     describe('Donation Withdrawals', () => {
       let recipient: string;
       let recipientUser: MarketUser;
-      let expectedDonation: bigint;
       beforeEach(async () => {
+        await reputationMarket.connect(deployer.ADMIN).setEntryProtocolFeeBasisPoints(0n);
+        await reputationMarket.connect(deployer.ADMIN).setExitProtocolFeeBasisPoints(0n);
         await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
         recipient = await reputationMarket.donationRecipient(DEFAULT.profileId);
         recipientUser = new MarketUser(await ethers.getSigner(recipient));
-        expectedDonation = (DEFAULT.buyAmount * BigInt(donationFee)) / BASIS_POINTS;
       });
 
       it('should allow donation recipient to withdraw accumulated donations', async () => {
-        await userA.buyVotes();
+        const buyAmount = DEFAULT.buyAmount * 100n;
+        const votesToBuy = 1n;
+
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(0n);
+        let { simulatedFundsPaid } = await userA.simulateBuy({ votesToBuy });
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
+
+        await userA.buyVotes({ buyAmount, votesToBuy });
+
         let { donationsWithdrawn } = await recipientUser.withdrawDonations();
+        let expectedDonation = (BigInt(simulatedFundsPaid) * BigInt(donationFee)) / BASIS_POINTS;
         expect(donationsWithdrawn).to.equal(expectedDonation);
+
         // do it again
-        await userA.buyVotes();
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(0n);
+        ({ simulatedFundsPaid } = await userA.simulateBuy({ votesToBuy }));
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
+        await userA.buyVotes({ buyAmount, votesToBuy });
+        expectedDonation = (BigInt(simulatedFundsPaid) * BigInt(donationFee)) / BASIS_POINTS;
         ({ donationsWithdrawn } = await recipientUser.withdrawDonations());
         expect(donationsWithdrawn).to.equal(expectedDonation);
+
         // do it for 5x as much
-        await userA.buyVotes({ buyAmount: DEFAULT.buyAmount * 5n });
-        ({ donationsWithdrawn } = await recipientUser.withdrawDonations());
-        expect(donationsWithdrawn).to.equal(expectedDonation * 5n);
-        // do it for distrust votes
-        await userA.buyVotes({ isPositive: false });
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(0n);
+        ({ simulatedFundsPaid } = await userA.simulateBuy({ votesToBuy: votesToBuy * 5n }));
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
+        await userA.buyVotes({ buyAmount, votesToBuy: votesToBuy * 5n });
+        expectedDonation = (BigInt(simulatedFundsPaid) * BigInt(donationFee)) / BASIS_POINTS;
         ({ donationsWithdrawn } = await recipientUser.withdrawDonations());
         expect(donationsWithdrawn).to.equal(expectedDonation);
-        // Escrow should be emptied
+
+        // do it for distrust votes
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(0n);
+        ({ simulatedFundsPaid } = await userA.simulateBuy({ isPositive: false, votesToBuy }));
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
+        await userA.buyVotes({ isPositive: false, buyAmount, votesToBuy });
+        expectedDonation = (BigInt(simulatedFundsPaid) * BigInt(donationFee)) / BASIS_POINTS;
+        ({ donationsWithdrawn } = await recipientUser.withdrawDonations());
+        expect(donationsWithdrawn).to.equal(expectedDonation);
+
+        // // Escrow should be emptied
         const escrowAfter = await reputationMarket.donationEscrow(recipient);
         expect(escrowAfter).to.equal(0);
       });
@@ -229,7 +298,16 @@ describe('ReputationMarket Fees', () => {
       });
 
       it('should emit DonationWithdrawn event', async () => {
-        await userA.buyVotes();
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(0n);
+        const { simulatedFundsPaid } = await userA.simulateBuy({
+          isPositive: false,
+          votesToBuy: 1n,
+        });
+        await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
+
+        await userA.buyVotes({ votesToBuy: 1n });
+
+        const expectedDonation = (BigInt(simulatedFundsPaid) * BigInt(donationFee)) / BASIS_POINTS;
         await expect(reputationMarket.connect(recipientUser.signer).withdrawDonations())
           .to.emit(reputationMarket, 'DonationWithdrawn')
           .withArgs(recipient, expectedDonation);
@@ -252,6 +330,30 @@ describe('ReputationMarket Fees', () => {
         let ethosUserC: EthosUser;
         let userB: MarketUser;
         let userC: MarketUser;
+        let expectedFirstVoteDonation: bigint;
+
+        async function calculateExpectedDonation(
+          profileId: bigint,
+          votesToBuy: bigint,
+        ): Promise<bigint> {
+          const existingDonationFee = await reputationMarket.donationBasisPoints();
+
+          // Temporarily clear the donation fee so the simulated price can be the basis of an explicit calculation.
+          await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(0n);
+          const { simulatedFundsPaid } = await userA.simulateBuy({
+            votesToBuy,
+            profileId,
+          });
+          const expectedDonation =
+            (BigInt(simulatedFundsPaid) * BigInt(donationFee)) / BASIS_POINTS;
+
+          // Reset the donation fee
+          await reputationMarket
+            .connect(deployer.ADMIN)
+            .setDonationBasisPoints(existingDonationFee);
+
+          return expectedDonation;
+        }
 
         beforeEach(async () => {
           ethosUserB = await deployer.createUser();
@@ -266,20 +368,23 @@ describe('ReputationMarket Fees', () => {
           await reputationMarket
             .connect(deployer.ADMIN)
             .createMarketWithConfigAdmin(ethosUserB.signer.address, 0, {
-              value: DEFAULT.initialLiquidity,
+              value: DEFAULT.creationCost,
             });
           await reputationMarket
             .connect(deployer.ADMIN)
             .createMarketWithConfigAdmin(ethosUserC.signer.address, 0, {
-              value: DEFAULT.initialLiquidity,
+              value: DEFAULT.creationCost,
             });
 
-          await userA.buyVotes();
-          await userB.buyVotes({ profileId: ethosUserB.profileId });
-          await userC.buyVotes({ profileId: ethosUserC.profileId });
+          expectedFirstVoteDonation = await calculateExpectedDonation(DEFAULT.profileId, 1n);
+
+          await userA.buyVotes({ votesToBuy: 1n });
+          await userB.buyVotes({ votesToBuy: 1n, profileId: ethosUserB.profileId });
+          await userC.buyVotes({ votesToBuy: 1n, profileId: ethosUserC.profileId });
         });
 
         it('should track and allow withdrawals for multiple donation recipients', async () => {
+          await reputationMarket.connect(deployer.ADMIN).setDonationBasisPoints(donationFee);
           const recipientB = await reputationMarket.donationRecipient(ethosUserB.profileId);
           const recipientC = await reputationMarket.donationRecipient(ethosUserC.profileId);
           const recipientUserB = new MarketUser(await ethers.getSigner(recipientB));
@@ -287,12 +392,12 @@ describe('ReputationMarket Fees', () => {
 
           // Verify initial escrow balances
           expect(await reputationMarket.donationEscrow(recipientB)).to.equal(
-            expectedDonation,
-            `A: Escrow for recipient B should be ${expectedDonation}`,
+            expectedFirstVoteDonation,
+            `A: Escrow for recipient B should be ${expectedFirstVoteDonation}`,
           );
           expect(await reputationMarket.donationEscrow(recipientC)).to.equal(
-            expectedDonation,
-            `B: Escrow for recipient C should be ${expectedDonation}`,
+            expectedFirstVoteDonation,
+            `B: Escrow for recipient C should be ${expectedFirstVoteDonation}`,
           );
 
           // First user withdraws
@@ -304,8 +409,8 @@ describe('ReputationMarket Fees', () => {
             `C: Escrow for recipient B should be 0`,
           );
           expect(await reputationMarket.donationEscrow(recipientC)).to.equal(
-            expectedDonation,
-            `D: Escrow for recipient C should be ${expectedDonation}`,
+            expectedFirstVoteDonation,
+            `D: Escrow for recipient C should be ${expectedFirstVoteDonation}`,
           );
 
           // Second user withdraws
@@ -323,14 +428,30 @@ describe('ReputationMarket Fees', () => {
         });
 
         it('should accumulate donations separately for each recipient', async () => {
+          const expectedSecondBuyDonation = await calculateExpectedDonation(
+            ethosUserB.profileId,
+            1n,
+          );
+
+          await userA.buyVotes({ votesToBuy: 1n });
+          await userB.buyVotes({ votesToBuy: 1n, profileId: ethosUserB.profileId });
+          await userC.buyVotes({ votesToBuy: 1n, profileId: ethosUserC.profileId });
           const recipientB = await reputationMarket.donationRecipient(ethosUserB.profileId);
           const recipientC = await reputationMarket.donationRecipient(ethosUserC.profileId);
 
+          // Determine third vote donation
+          const expectedThirdBuyDonation = await calculateExpectedDonation(
+            ethosUserB.profileId,
+            1n,
+          );
+
           // Buy votes multiple times for different markets
-          await userA.buyVotes({ profileId: ethosUserB.profileId }); // Second purchase for market B
-          await userA.buyVotes({ profileId: ethosUserC.profileId }); // Second purchase for market C
-          const expectedDonationB = (DEFAULT.buyAmount * BigInt(donationFee) * 2n) / BASIS_POINTS; // 2 purchases
-          const expectedDonationC = (DEFAULT.buyAmount * BigInt(donationFee) * 2n) / BASIS_POINTS; // 2 purchases
+          await userA.buyVotes({ votesToBuy: 1n, profileId: ethosUserB.profileId }); // Second purchase for market B
+          await userA.buyVotes({ votesToBuy: 1n, profileId: ethosUserC.profileId }); // Second purchase for market C
+          const expectedDonationB =
+            expectedFirstVoteDonation + expectedSecondBuyDonation + expectedThirdBuyDonation; // 3 purchases
+          const expectedDonationC =
+            expectedFirstVoteDonation + expectedSecondBuyDonation + expectedThirdBuyDonation; // 3 purchases
 
           expect(await reputationMarket.donationEscrow(recipientB)).to.equal(expectedDonationB);
           expect(await reputationMarket.donationEscrow(recipientC)).to.equal(expectedDonationC);
@@ -393,7 +514,7 @@ describe('ReputationMarket Fees', () => {
 
         it('should maintain separate escrow balances when recipient is updated', async () => {
           // First purchase creates donations for original recipient
-          const firstDonation = (DEFAULT.buyAmount * BigInt(donationFee)) / BASIS_POINTS;
+          const firstDonation = await reputationMarket.donationEscrow(recipient);
 
           // Update recipient
           await reputationMarket
@@ -401,8 +522,10 @@ describe('ReputationMarket Fees', () => {
             .updateDonationRecipient(DEFAULT.profileId, newRecipient);
 
           // Second purchase creates donations for new recipient
+          const donationBefore = await reputationMarket.donationEscrow(newRecipient);
           await userA.buyVotes();
-          const secondDonation = (DEFAULT.buyAmount * BigInt(donationFee)) / BASIS_POINTS;
+          const donationAfter = await reputationMarket.donationEscrow(newRecipient);
+          const secondDonation = donationAfter - donationBefore;
 
           // Check escrow balances
           expect(await reputationMarket.donationEscrow(recipient)).to.equal(

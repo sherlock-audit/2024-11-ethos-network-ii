@@ -9,12 +9,13 @@ const { ethers } = hre;
 export const DEFAULT = {
   reputationMarket: undefined as unknown as ReputationMarket,
   profileId: 1n,
-  initialLiquidity: ethers.parseEther('1.0'),
-  buyAmount: ethers.parseEther('0.01'),
-  slippageBasisPoints: 100, // 100 basis points = 1%
-  value: { value: ethers.parseEther('0.001') },
+  liquidity: 1000n,
+  buyAmount: ethers.parseEther('.01'),
+  value: { value: ethers.parseEther('.1') },
   isPositive: true,
   sellVotes: 10n,
+  votesToBuy: 10n,
+  creationCost: ethers.parseEther('1'),
 };
 
 type Params = {
@@ -23,8 +24,9 @@ type Params = {
   isPositive: boolean;
   buyAmount: bigint;
   sellVotes: bigint;
-  slippageBasisPoints: number;
-  expectedVotes?: bigint;
+  votesToBuy: bigint;
+  minVotesToBuy: bigint;
+  minSellPrice: bigint;
 };
 
 type Result = {
@@ -37,23 +39,19 @@ type Result = {
 };
 
 function getParams(params?: Partial<Params>): Params {
+  const votesToBuy = params?.votesToBuy ?? DEFAULT.votesToBuy;
+  const minVotesToBuy = params?.minVotesToBuy ?? votesToBuy;
+
   return {
     reputationMarket: params?.reputationMarket ?? DEFAULT.reputationMarket,
     profileId: params?.profileId ?? DEFAULT.profileId,
     isPositive: params?.isPositive ?? DEFAULT.isPositive,
-    buyAmount: params?.buyAmount ?? DEFAULT.buyAmount,
+    buyAmount: params?.buyAmount ?? DEFAULT.buyAmount * votesToBuy,
     sellVotes: params?.sellVotes ?? DEFAULT.sellVotes,
-    slippageBasisPoints: params?.slippageBasisPoints ?? DEFAULT.slippageBasisPoints,
-    expectedVotes: params?.expectedVotes,
+    votesToBuy,
+    minVotesToBuy,
+    minSellPrice: params?.minSellPrice ?? 0n,
   };
-}
-
-export async function getExpectedVotePrice(params?: Partial<Params>): Promise<bigint> {
-  const { reputationMarket, profileId, isPositive } = getParams(params);
-  const market = await reputationMarket.getMarket(profileId);
-  const totalVotes = market.trustVotes + market.distrustVotes;
-
-  return ((isPositive ? market.trustVotes : market.distrustVotes) * DEFAULT.buyAmount) / totalVotes;
 }
 
 function isEventLog(log: Log): log is EventLog {
@@ -118,52 +116,31 @@ export class MarketUser {
   async simulateBuy(params?: Partial<Params>): Promise<{
     simulatedVotesBought: bigint;
     simulatedFundsPaid: bigint;
-    simulatedNewVotePrice: bigint;
     simulatedProtocolFee: bigint;
     simulatedDonation: bigint;
-    simulatedMinVotePrice: bigint;
-    simulatedMaxVotePrice: bigint;
+    newVotePrice: bigint;
   }> {
-    const { reputationMarket, profileId, isPositive, buyAmount } = getParams(params);
-    const [
-      simulatedVotesBought,
-      simulatedFundsPaid,
-      simulatedNewVotePrice,
-      simulatedProtocolFee,
-      simulatedDonation,
-      simulatedMinVotePrice,
-      simulatedMaxVotePrice,
-    ] = await reputationMarket.connect(this.signer).simulateBuy(profileId, isPositive, buyAmount);
+    const { reputationMarket, profileId, isPositive, votesToBuy } = getParams(params);
+    const { purchaseCostBeforeFees, protocolFee, donation, newVotePrice } = await reputationMarket
+      .connect(this.signer)
+      .simulateBuy(profileId, isPositive, votesToBuy);
 
     return {
-      simulatedVotesBought,
-      simulatedFundsPaid,
-      simulatedNewVotePrice,
-      simulatedProtocolFee,
-      simulatedDonation,
-      simulatedMinVotePrice,
-      simulatedMaxVotePrice,
+      simulatedVotesBought: votesToBuy,
+      simulatedFundsPaid: purchaseCostBeforeFees + protocolFee + donation,
+      simulatedProtocolFee: protocolFee,
+      simulatedDonation: donation,
+      newVotePrice,
     };
   }
 
   async buyVotes(params?: Partial<Params>): Promise<Result> {
-    const {
-      reputationMarket,
-      profileId,
-      isPositive,
-      buyAmount,
-      slippageBasisPoints,
-      expectedVotes,
-    } = getParams(params);
-
-    let expectedVoteCount = expectedVotes;
-
-    const { simulatedVotesBought } = await this.simulateBuy(params);
-    expectedVoteCount = expectedVoteCount ?? simulatedVotesBought;
+    const { reputationMarket, profileId, isPositive, buyAmount, minVotesToBuy, votesToBuy } =
+      getParams(params);
 
     const tx: ContractTransactionResponse = await reputationMarket
       .connect(this.signer)
-      .buyVotes(profileId, isPositive, expectedVoteCount, slippageBasisPoints, {
+      .buyVotes(profileId, isPositive, votesToBuy, minVotesToBuy, {
         value: buyAmount,
       });
     const { gas } = await this.getGas(tx);
@@ -175,39 +152,36 @@ export class MarketUser {
     return { gas, trustVotes, distrustVotes, balance, fundsPaid };
   }
 
+  async buyOneVote(params?: Partial<Params>): Promise<Result> {
+    return await this.buyVotes(getParams({ ...params, votesToBuy: 1n }));
+  }
+
   async simulateSell(params?: Partial<Params>): Promise<{
     simulatedVotesSold: bigint;
     simulatedFundsReceived: bigint;
-    simulatedNewVotePrice: bigint;
     simulatedProtocolFee: bigint;
-    simulatedMinVotePrice: bigint;
-    simulatedMaxVotePrice: bigint;
+    simulatedSellPrice: bigint;
+    newVotePrice: bigint;
   }> {
     const { reputationMarket, profileId, isPositive, sellVotes } = getParams(params);
-    const [
-      simulatedVotesSold,
-      simulatedFundsReceived,
-      simulatedNewVotePrice,
-      simulatedProtocolFee,
-      simulatedMinVotePrice,
-      simulatedMaxVotePrice,
-    ] = await reputationMarket.connect(this.signer).simulateSell(profileId, isPositive, sellVotes);
+    const { proceedsBeforeFees, protocolFee, newVotePrice } = await reputationMarket
+      .connect(this.signer)
+      .simulateSell(profileId, isPositive, sellVotes);
 
     return {
-      simulatedVotesSold,
-      simulatedFundsReceived,
-      simulatedNewVotePrice,
-      simulatedProtocolFee,
-      simulatedMinVotePrice,
-      simulatedMaxVotePrice,
+      simulatedVotesSold: sellVotes,
+      simulatedFundsReceived: proceedsBeforeFees - protocolFee,
+      simulatedProtocolFee: protocolFee,
+      simulatedSellPrice: sellVotes > 0n ? proceedsBeforeFees / sellVotes : 0n,
+      newVotePrice,
     };
   }
 
   async sellVotes(params?: Partial<Params>): Promise<Result> {
-    const { reputationMarket, profileId, isPositive, sellVotes } = getParams(params);
+    const { reputationMarket, profileId, isPositive, sellVotes, minSellPrice } = getParams(params);
     const tx: ContractTransactionResponse = await reputationMarket
       .connect(this.signer)
-      .sellVotes(profileId, isPositive, sellVotes);
+      .sellVotes(profileId, isPositive, sellVotes, minSellPrice);
     const { gas } = await this.getGas(tx);
     const { trustVotes, distrustVotes, balance } = await this.getVotes(params);
     const receipt = await tx.wait();
@@ -217,17 +191,8 @@ export class MarketUser {
     return { gas, trustVotes, distrustVotes, balance, fundsReceived };
   }
 
-  async buyOneVote(params?: Partial<Params>): Promise<Result> {
-    const { profileId, reputationMarket, isPositive } = getParams({ ...params });
-    const votePrice = await reputationMarket.getVotePrice(profileId, isPositive);
-
-    return await this.buyVotes(getParams({ ...params, buyAmount: votePrice }));
-  }
-
   async sellOneVote(params?: Partial<Params>): Promise<Result> {
-    const updatedParams = getParams({ ...params, sellVotes: 1n });
-
-    return await this.sellVotes(updatedParams);
+    return await this.sellVotes(getParams({ ...params, sellVotes: 1n }));
   }
 
   async withdrawDonations(): Promise<{ donationsWithdrawn: bigint }> {

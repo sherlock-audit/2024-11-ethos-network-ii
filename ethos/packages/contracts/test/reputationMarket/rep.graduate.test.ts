@@ -44,7 +44,7 @@ describe('ReputationMarket Graduation', () => {
     await reputationMarket
       .connect(deployer.ADMIN)
       .createMarketWithConfigAdmin(ethosUserA.signer.address, 0, {
-        value: DEFAULT.initialLiquidity,
+        value: DEFAULT.creationCost,
       });
 
     graduator = deployer.ADMIN;
@@ -151,7 +151,7 @@ describe('ReputationMarket Graduation', () => {
       await reputationMarket.connect(deployer.ADMIN).setAllowListEnforcement(false);
       await reputationMarket
         .connect(ethosUserB.signer)
-        .createMarket({ value: DEFAULT.initialLiquidity });
+        .createMarket({ value: DEFAULT.creationCost });
 
       await expect(
         reputationMarket.connect(graduator).withdrawGraduatedMarketFunds(ethosUserB.profileId),
@@ -177,11 +177,10 @@ describe('ReputationMarket Graduation', () => {
         .setUserAllowedToCreateMarket(newProfileId, true);
       await reputationMarket
         .connect(ethosUserB.signer)
-        .createMarket({ value: DEFAULT.initialLiquidity });
+        .createMarket({ value: DEFAULT.creationCost });
+      const [, , creationCost] = await reputationMarket.marketConfigs(0); // 0 is the default config
 
-      const PRICE_MAXIMUM = await reputationMarket.DEFAULT_PRICE();
-
-      expect(await reputationMarket.marketFunds(newProfileId)).to.equal(2n * PRICE_MAXIMUM);
+      expect(await reputationMarket.marketFunds(newProfileId)).to.equal(creationCost);
     });
 
     it('should track funds correctly during buy and sell operations', async () => {

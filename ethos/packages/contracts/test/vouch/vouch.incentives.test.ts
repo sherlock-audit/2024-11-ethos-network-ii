@@ -1,13 +1,12 @@
 import { loadFixture } from '@nomicfoundation/hardhat-toolbox/network-helpers.js';
 import { expect } from 'chai';
 import hre from 'hardhat';
+import { calcFeeDistribution } from '../utils/common.js';
 import { DEFAULT, VOUCH_PARAMS } from '../utils/defaults.js';
 import { createDeployer, type EthosDeployer } from '../utils/deployEthos.js';
 import { type EthosUser } from '../utils/ethosUser.js';
 
 const { ethers } = hre;
-
-const BASIS_POINTS = 10000n;
 
 describe('Vouch Incentives', () => {
   let deployer: EthosDeployer;
@@ -37,8 +36,14 @@ describe('Vouch Incentives', () => {
     await setupVouchIncentives();
     const { vouchId } = await userA.vouch(userB, { paymentAmount });
     const balance = await userA.getVouchBalance(vouchId);
-    const expected = paymentAmount;
-    expect(balance).to.be.closeTo(expected, 1);
+
+    // For first vouch, calculate deposit with only vouchers pool fee
+    const { deposit } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n,
+    });
+    expect(balance).to.be.closeTo(deposit, 1n);
   });
 
   it('should allow changing the vouch incentives percentage', async () => {
@@ -66,27 +71,35 @@ describe('Vouch Incentives', () => {
     const paymentAmount = ethers.parseEther('0.1');
     await setupVouchIncentives();
 
-    // First vouch - no fees
+    // First vouch - only vouchers pool fee
     const { vouchId: vouchId0 } = await userB.vouch(userA, { paymentAmount });
-
-    // Verify first vouch balance
     const vouch0InitialBalance = await userB.getVouchBalance(vouchId0);
-    expect(vouch0InitialBalance).to.equal(paymentAmount);
+
+    // Calculate first vouch deposit
+    const { deposit: firstDeposit } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n, // no vouch incentives for first vouch
+    });
+    expect(vouch0InitialBalance).to.equal(firstDeposit);
 
     // Second vouch - with fees
     const { vouchId: vouchId1 } = await userC.vouch(userA, { paymentAmount });
 
-    // Calculate exact fee amount
-    // fee = total - (total * 10000 / (10000 + feeBasisPoints))
-    const vouchIncentiveFee = paymentAmount - (paymentAmount * 10000n) / (10000n + vouchIncentives);
+    // Calculate fees for second vouch
+    const { deposit: secondDeposit, shares } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives,
+    });
 
     // First voucher should have original amount plus all incentive fees
     const vouch0FinalBalance = await userB.getVouchBalance(vouchId0);
-    expect(vouch0FinalBalance).to.equal(paymentAmount + vouchIncentiveFee);
+    expect(vouch0FinalBalance).to.equal(firstDeposit + shares.vouchersPool);
 
     // Second voucher should have amount minus incentive fees
     const vouch1Balance = await userC.getVouchBalance(vouchId1);
-    expect(vouch1Balance).to.be.closeTo(paymentAmount - vouchIncentiveFee, 1);
+    expect(vouch1Balance).to.equal(secondDeposit);
   });
 
   it('should deduct vouch incentives for the third voucher and with varying amounts', async () => {
@@ -99,18 +112,29 @@ describe('Vouch Incentives', () => {
       paymentAmount: amount1,
     });
 
+    // Calculate first vouch deposit
+    const { deposit: deposit1 } = calcFeeDistribution(amount1, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n, // no vouch incentives for first vouch
+    });
+
     // Second vouch - fees to first voucher
     const amount2 = DEFAULT.PAYMENT_AMOUNT * 2n;
     const { vouchId: vouchId1 } = await userC.vouch(userA, {
       paymentAmount: amount2,
     });
 
-    // Calculate fee from second vouch
-    const fee2 = amount2 - (amount2 * BASIS_POINTS) / (BASIS_POINTS + vouchIncentives);
+    // Calculate second vouch fees
+    const { deposit: deposit2, shares: shares2 } = calcFeeDistribution(amount2, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives,
+    });
 
     // Verify first vouch received all fees from second vouch
-    expect(await userB.getVouchBalance(vouchId0)).to.equal(amount1 + fee2);
-    expect(await userC.getVouchBalance(vouchId1)).to.equal(amount2 - fee2);
+    expect(await userB.getVouchBalance(vouchId0)).to.equal(deposit1 + shares2.vouchersPool);
+    expect(await userC.getVouchBalance(vouchId1)).to.equal(deposit2);
 
     // Third vouch - fees split proportionally
     const amount3 = DEFAULT.PAYMENT_AMOUNT * 3n;
@@ -118,18 +142,25 @@ describe('Vouch Incentives', () => {
       paymentAmount: amount3,
     });
 
-    // Calculate fee from third vouch
-    const fee3 = amount3 - (amount3 * BASIS_POINTS) / (BASIS_POINTS + vouchIncentives);
+    // Calculate third vouch fees
+    const { deposit: deposit3, shares: shares3 } = calcFeeDistribution(amount3, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives,
+    });
 
-    // Calculate proportional distribution of fee3
-    const totalBalance = amount1 + fee2 + (amount2 - fee2);
-    const vouch0Share = (fee3 * (amount1 + fee2)) / totalBalance;
-    const vouch1Share = (fee3 * (amount2 - fee2)) / totalBalance;
+    // Calculate proportional distribution of shares3.vouchersPool
+    const totalBalance = deposit1 + shares2.vouchersPool + deposit2;
+    const vouch0Share = (shares3.vouchersPool * (deposit1 + shares2.vouchersPool)) / totalBalance;
+    const vouch1Share = (shares3.vouchersPool * deposit2) / totalBalance;
 
     // Verify final balances
-    expect(await userB.getVouchBalance(vouchId0)).to.be.closeTo(amount1 + fee2 + vouch0Share, 1);
-    expect(await userC.getVouchBalance(vouchId1)).to.be.closeTo(amount2 - fee2 + vouch1Share, 1);
-    expect(await userD.getVouchBalance(vouchId2)).to.be.closeTo(amount3 - fee3, 1);
+    expect(await userB.getVouchBalance(vouchId0)).to.be.closeTo(
+      deposit1 + shares2.vouchersPool + vouch0Share,
+      1n,
+    );
+    expect(await userC.getVouchBalance(vouchId1)).to.be.closeTo(deposit2 + vouch1Share, 1n);
+    expect(await userD.getVouchBalance(vouchId2)).to.equal(deposit3);
   });
 
   it('should correctly distribute incentives among multiple first vouchers', async () => {
@@ -139,21 +170,35 @@ describe('Vouch Incentives', () => {
     // First vouch - userB is first voucher
     const { vouchId: vouchId0 } = await userB.vouch(userA);
 
-    // Verify first vouch has no fees deducted
-    expect(await userB.getVouchBalance(vouchId0)).to.equal(paymentAmount);
+    // Calculate first vouch deposit
+    const { deposit: firstDeposit } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n, // no vouch incentives for first vouch
+    });
+
+    // Verify first vouch deposit
+    expect(await userB.getVouchBalance(vouchId0)).to.equal(firstDeposit);
 
     // UserB unvouches completely
     await userB.unvouch(vouchId0);
 
-    // Verify balance is zero after unvouch instead of expecting revert
+    // Verify balance is zero after unvouch
     const unvouchedBalance = await userB.getVouchBalance(vouchId0);
     expect(unvouchedBalance).to.equal(0n);
 
     // Now userC becomes the new first voucher
     const { vouchId: vouchId1 } = await userC.vouch(userA);
 
-    // Verify new first vouch has no fees deducted
-    expect(await userC.getVouchBalance(vouchId1)).to.equal(paymentAmount);
+    // Calculate new first vouch deposit
+    const { deposit: newFirstDeposit } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n, // no vouch incentives for first vouch
+    });
+
+    // Verify new first vouch deposit
+    expect(await userC.getVouchBalance(vouchId1)).to.equal(newFirstDeposit);
 
     // UserC unvouches completely
     await userC.unvouch(vouchId1);
@@ -162,24 +207,32 @@ describe('Vouch Incentives', () => {
     const userD = await deployer.createUser();
     const { vouchId: vouchId2 } = await userD.vouch(userA);
 
-    // Verify the new first vouch has no fees deducted
-    expect(await userD.getVouchBalance(vouchId2)).to.equal(paymentAmount);
+    // Calculate next first vouch deposit
+    const { deposit: nextFirstDeposit } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n, // no vouch incentives for first vouch
+    });
+
+    // Verify the new first vouch deposit
+    expect(await userD.getVouchBalance(vouchId2)).to.equal(nextFirstDeposit);
 
     // Now make a second vouch while userD is first voucher
     const userE = await deployer.createUser();
     const { vouchId: vouchId3 } = await userE.vouch(userA);
 
-    // Calculate expected fee
-    const vouchIncentiveFee = paymentAmount - (paymentAmount * 10000n) / (10000n + vouchIncentives);
+    // Calculate fees for second vouch
+    const { deposit: secondDeposit, shares } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives,
+    });
 
     // Verify userD (first voucher) received the incentive fee
-    expect(await userD.getVouchBalance(vouchId2)).to.equal(paymentAmount + vouchIncentiveFee);
+    expect(await userD.getVouchBalance(vouchId2)).to.equal(nextFirstDeposit + shares.vouchersPool);
 
-    // Verify userE (second voucher) had fees deducted
-    expect(await userE.getVouchBalance(vouchId3)).to.be.closeTo(
-      paymentAmount - vouchIncentiveFee,
-      1,
-    );
+    // Verify userE (second voucher) has deposit amount
+    expect(await userE.getVouchBalance(vouchId3)).to.equal(secondDeposit);
   });
 
   it('should handle incentive distribution with varying stake amounts', async () => {
@@ -229,52 +282,52 @@ describe('Vouch Incentives', () => {
   });
 
   it('should correctly distribute incentives after users unvouch and revouch', async () => {
-    const paymentAmount = ethers.parseEther('0.1');
+    const paymentAmount = VOUCH_PARAMS.paymentAmount;
     await setupVouchIncentives();
 
-    // First vouch - no fees
-    const { vouchId: vouchId0 } = await userB.vouch(userA, { paymentAmount });
+    // First vouch
+    const { vouchId: vouchId0 } = await userB.vouch(userA);
 
-    // Second vouch - with fees
-    const { vouchId: vouchId1 } = await userC.vouch(userA, { paymentAmount });
+    // Calculate first vouch deposit
+    const { deposit: firstDeposit } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n, // no vouch incentives for first vouch
+    });
 
-    // Calculate fee amount
-    const vouchIncentiveFee = paymentAmount - (paymentAmount * 10000n) / (10000n + vouchIncentives);
+    // Verify first vouch deposit
+    expect(await userB.getVouchBalance(vouchId0)).to.equal(firstDeposit);
 
-    // Verify initial balances
-    expect(await userB.getVouchBalance(vouchId0)).to.equal(paymentAmount + vouchIncentiveFee);
-    expect(await userC.getVouchBalance(vouchId1)).to.be.closeTo(
-      paymentAmount - vouchIncentiveFee,
-      1,
-    );
+    // Second vouch
+    const { vouchId: vouchId1 } = await userC.vouch(userA);
 
-    // UserB completely unvouches
+    // Calculate second vouch fees
+    const { deposit: secondDeposit, shares } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives,
+    });
+
+    // Verify balances after second vouch
+    expect(await userB.getVouchBalance(vouchId0)).to.equal(firstDeposit + shares.vouchersPool);
+    expect(await userC.getVouchBalance(vouchId1)).to.equal(secondDeposit);
+
+    // UserB unvouches
     await userB.unvouch(vouchId0);
 
-    // Verify balance is zero after unvouch instead of expecting revert
-    const unvouchedBalance = await userB.getVouchBalance(vouchId0);
-    expect(unvouchedBalance).to.equal(0n);
+    // UserB revouches
+    const { vouchId: vouchId2 } = await userB.vouch(userA);
 
-    // UserD vouches after unvouch
-    const userD = await deployer.createUser();
-    const { vouchId: vouchId2 } = await userD.vouch(userA, { paymentAmount });
-
-    // Get final stakes
-    const finalVouch1Stakes = await userC.getVouchBalance(vouchId1);
-    const finalVouch2Stakes = await userD.getVouchBalance(vouchId2);
+    // Calculate new vouch fees
+    const { deposit: newDeposit, shares: newShares } = calcFeeDistribution(paymentAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives,
+    });
 
     // Verify final balances
-    // UserB should have no balance after unvouch
-    expect(await userB.getVouchBalance(vouchId0)).to.equal(0n);
-    expect(await userC.getVouchBalance(vouchId1)).to.be.closeTo(finalVouch1Stakes, 1);
-    expect(await userD.getVouchBalance(vouchId2)).to.be.closeTo(finalVouch2Stakes, 1);
-
-    // UserB revouches
-    const { vouchId: vouchId3 } = await userB.vouch(userA, { paymentAmount });
-    const finalVouch3Stakes = await userB.getVouchBalance(vouchId3);
-
-    // Verify revouch balance
-    expect(await userB.getVouchBalance(vouchId3)).to.be.closeTo(finalVouch3Stakes, 1);
+    expect(await userB.getVouchBalance(vouchId2)).to.equal(newDeposit);
+    expect(await userC.getVouchBalance(vouchId1)).to.equal(secondDeposit + newShares.vouchersPool);
   });
 
   it('should correctly handle donations with zero fees configured', async () => {
@@ -299,5 +352,86 @@ describe('Vouch Incentives', () => {
     const userD = await deployer.createUser();
     const { vouchId: vouchId2 } = await userD.vouch(userA, { paymentAmount });
     expect(await userD.getVouchBalance(vouchId2)).to.equal(paymentAmount);
+  });
+
+  it('should not distribute vouch rewards to oneself when increasing vouch', async () => {
+    const initialAmount = ethers.parseEther('1');
+    const increaseAmount = ethers.parseEther('2');
+    await userA.setBalance('10');
+    await setupVouchIncentives();
+
+    // First vouch
+    const { vouchId } = await userA.vouch(userB, { paymentAmount: initialAmount });
+
+    // Calculate initial deposit
+    const { deposit: initialDeposit } = calcFeeDistribution(initialAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n, // no vouch incentives for first vouch
+    });
+
+    // Calculate increase deposit
+    const { deposit: increaseDeposit } = calcFeeDistribution(increaseAmount, {
+      entry: 0n,
+      donation: 0n,
+      vouchIncentives: 0n, // no vouch incentives when increasing vouch where you're the only voucher
+    });
+
+    // Increase vouch
+    await userA.increaseVouch(vouchId, { paymentAmount: increaseAmount });
+    const finalBalance = await userA.getVouchBalance(vouchId);
+
+    // Should just be initial deposit + increase deposit (no self-rewards)
+    const expectedBalance = initialDeposit + increaseDeposit;
+    expect(finalBalance).to.equal(expectedBalance);
+  });
+
+  it('should not allow fee bypass by splitting vouch into smaller amounts', async () => {
+    const oneEth = ethers.parseEther('1'); // 1 ETH per increase
+    const tenEth = 10n * oneEth;
+    await setupVouchIncentives();
+
+    // First user vouches with small amount to establish voucher pool
+    const firstVoucher = await deployer.createUser();
+    await firstVoucher.setBalance('100');
+    await firstVoucher.vouch(userA, {
+      paymentAmount: oneEth,
+    });
+
+    // Single large vouch user
+    const singleVouchUser = await deployer.createUser();
+    await singleVouchUser.setBalance('100');
+    const { vouchId: singleVouchId } = await singleVouchUser.vouch(userA, {
+      paymentAmount: tenEth,
+    });
+
+    // Calculate single vouch fees
+    const singleVouchFees = tenEth - (await singleVouchUser.getVouchBalance(singleVouchId));
+
+    // Multi small vouch user
+    const multiVouchUser = await deployer.createUser();
+    await multiVouchUser.setBalance('100');
+
+    // Initial small vouch
+    const { vouchId: multiVouchId } = await multiVouchUser.vouch(userA, {
+      paymentAmount: oneEth,
+    });
+    const initialBalance = await multiVouchUser.getVouchBalance(multiVouchId);
+
+    let totalFees = oneEth - initialBalance;
+
+    // Increase vouch 9 more times to reach same total
+    for (let i = 0; i < 9; i++) {
+      const balanceBefore = await multiVouchUser.getVouchBalance(multiVouchId);
+      await multiVouchUser.increaseVouch(multiVouchId, {
+        paymentAmount: oneEth,
+      });
+      const balanceAfter = await multiVouchUser.getVouchBalance(multiVouchId);
+      const feesThisIncrease = oneEth - (balanceAfter - balanceBefore);
+      totalFees += feesThisIncrease;
+    }
+
+    // Fees should be similar regardless of approach
+    expect(totalFees).to.be.closeTo(singleVouchFees, 1);
   });
 });

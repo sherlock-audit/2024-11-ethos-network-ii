@@ -29,7 +29,7 @@ describe('EthosAttestation Create Attestation', () => {
   const ATTESTATION_EVIDENCE_0 = 'ATTESTATION_EVIDENCE_0';
   // const ATTESTATION_EVIDENCE_1 = 'ATTESTATION_EVIDENCE_1';
 
-  const reAttest = async (): Promise<string> => {
+  async function reAttest(): Promise<string> {
     let signature = await common.signatureForCreateAttestation(
       '2',
       '3592832',
@@ -70,7 +70,7 @@ describe('EthosAttestation Create Attestation', () => {
       );
 
     return aHash;
-  };
+  }
 
   beforeEach(async () => {
     deployer = await loadFixture(createDeployer);
