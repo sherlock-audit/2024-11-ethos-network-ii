@@ -37,9 +37,7 @@ describe('Reputation Market Control', () => {
     await reputationMarket
       .connect(deployer.ADMIN)
       .setUserAllowedToCreateMarket(ethosUserA.profileId, true);
-    await reputationMarket
-      .connect(ethosUserA.signer)
-      .createMarket({ value: DEFAULT.initialLiquidity });
+    await reputationMarket.connect(ethosUserA.signer).createMarket({ value: DEFAULT.creationCost });
   });
 
   describe('Pauseable', () => {
@@ -67,7 +65,7 @@ describe('Reputation Market Control', () => {
         .connect(deployer.OWNER)
         .pauseContract(smartContractNames.reputationMarket);
       await expect(
-        reputationMarket.connect(userA.signer).createMarket({ value: DEFAULT.initialLiquidity }),
+        reputationMarket.connect(userA.signer).createMarket({ value: DEFAULT.creationCost }),
       ).to.be.revertedWithCustomError(reputationMarket, 'EnforcedPause');
     });
   });
@@ -103,9 +101,7 @@ describe('Reputation Market Control', () => {
 
     it('Should revert with MarketCreationUnauthorized when creating a market from a non-allowed profile', async () => {
       await expect(
-        reputationMarket
-          .connect(ethosUserB.signer)
-          .createMarket({ value: DEFAULT.initialLiquidity }),
+        reputationMarket.connect(ethosUserB.signer).createMarket({ value: DEFAULT.creationCost }),
       )
         .to.be.revertedWithCustomError(reputationMarket, 'MarketCreationUnauthorized')
         .withArgs(0, ethosUserB.signer.address, ethosUserB.profileId);
@@ -115,7 +111,7 @@ describe('Reputation Market Control', () => {
       await reputationMarket.connect(deployer.ADMIN).setAllowListEnforcement(false);
       await reputationMarket
         .connect(ethosUserB.signer)
-        .createMarket({ value: DEFAULT.initialLiquidity });
+        .createMarket({ value: DEFAULT.creationCost });
 
       const market = await reputationMarket.getMarket(ethosUserB.profileId);
 
@@ -130,7 +126,7 @@ describe('Reputation Market Control', () => {
         .setUserAllowedToCreateMarket(ethosUserB.profileId, true);
       await reputationMarket
         .connect(ethosUserB.signer)
-        .createMarket({ value: DEFAULT.initialLiquidity });
+        .createMarket({ value: DEFAULT.creationCost });
 
       const market = await reputationMarket.getMarket(ethosUserB.profileId);
 
@@ -147,9 +143,7 @@ describe('Reputation Market Control', () => {
         .connect(deployer.ADMIN)
         .setUserAllowedToCreateMarket(ethosUserB.profileId, false);
       await expect(
-        reputationMarket
-          .connect(ethosUserB.signer)
-          .createMarket({ value: DEFAULT.initialLiquidity }),
+        reputationMarket.connect(ethosUserB.signer).createMarket({ value: DEFAULT.creationCost }),
       )
         .to.be.revertedWithCustomError(reputationMarket, 'MarketCreationUnauthorized')
         .withArgs(0, ethosUserB.signer.address, ethosUserB.profileId);

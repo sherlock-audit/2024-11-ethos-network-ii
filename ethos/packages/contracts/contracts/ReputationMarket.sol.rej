@@ -1,0 +1,1316 @@
+diff a/ethos/packages/contracts/contracts/ReputationMarket.sol b/ethos/packages/contracts/contracts/ReputationMarket.sol	(rejected hunks)
+@@ -4,19 +4,22 @@ import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils
+ import { AccessControl } from "./utils/AccessControl.sol";
+ import { ETHOS_PROFILE } from "./utils/Constants.sol";
+ import { IEthosProfile } from "./interfaces/IEthosProfile.sol";
+-import { InsufficientInitialLiquidity, InactiveMarket, InsufficientFunds, FeeTransferFailed, InsufficientVotesOwned, InsufficientVotesToSell, InvalidProfileId, MarketAlreadyExists, MarketCreationErrorCode, MarketCreationUnauthorized, MarketDoesNotExist, SlippageLimitExceeded, InvalidMarketConfigOption, UnauthorizedGraduation, UnauthorizedWithdrawal, MarketNotGraduated, ZeroAddressNotAllowed } from "./errors/ReputationMarketErrors.sol";
++import { InsufficientLiquidity, InactiveMarket, InsufficientFunds, FeeTransferFailed, InsufficientVotesOwned, InsufficientVotesToSell, InvalidProfileId, MarketAlreadyExists, MarketCreationErrorCode, MarketCreationUnauthorized, MarketDoesNotExist, SellSlippageLimitExceeded, InvalidMarketConfigOption, UnauthorizedGraduation, UnauthorizedWithdrawal, MarketNotGraduated, ZeroAddressNotAllowed } from "./errors/ReputationMarketErrors.sol";
+ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
++import { LMSR } from "./utils/LMSR.sol";
++import { ITargetStatus } from "./interfaces/ITargetStatus.sol";
+ 
+ /**
+  * @title ReputationMarket
+  * @dev This contract establishes Reputation Markets, allowing buying and selling of "trust" and "distrust" votes for specific
+- * Ethos profiles, reflecting the perceived reputation of the profile's owner. The vote prices fluctuate dynamically based on
+- * demand, where an increase in trust votes implies higher reputation, and an increase in distrust votes implies lower reputation.
+- * This setup allows participants to potentially profit by speculating on a profile's future reputation.
++ * Ethos profiles, reflecting the perceived reputation of the profile's owner. Using a Logarithmic Market Scoring Rule (LMSR),
++ * vote prices fluctuate dynamically based on demand: an increase in trust votes raises their price while lowering distrust prices,
++ * and vice versa. This setup allows participants to potentially profit by buying votes at lower prices and selling them at higher
++ * prices when sentiment changes.
+  *
+  * The vote pricing model functions like a prediction market with perpetual duration, inversely adjusting trust and distrust
+- * prices. As the trust price rises, the distrust price decreases by an equal amount, with both prices summing to a set maximum.
++ * prices. As the trust price rises, the distrust price decreases proportionally, with both prices always summing to the market's basePrice.
+  * This mechanism reflects the balance of sentiment, allowing users to gauge a profile's perceived trustworthiness as a percentage.
+  * Unlike traditional prediction markets, this model has no end date or decision criteria, operating continuously until market graduation.
+  *
+@@ -29,11 +32,11 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+  * Market configurations offer different initial setups to control the volatility and stability of reputation markets.
+  * With the default configuration, a low number of initial votes can cause significant price fluctuations, leading to a highly
+  * volatile market. To provide flexibility, we offer additional configurations (e.g., deluxe, premium) with varying initial
+- * vote counts and liquidity. These configurations allow market creators to choose the market's volatility level: lower initial
+- * votes result in faster price changes, while higher initial votes enable smoother, gradual price adjustments. Ethos admins can
++ * liquidity parameters. These configurations allow market creators to choose the market's volatility level: lower liquidity
++ * parameters result in faster price changes, while higher liquidity enables smoother, gradual price adjustments. Ethos admins can
+  * add or remove configurations without modifying the core contract, enabling ongoing experimentation with different market structures.
+  */
+-contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
++contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard, ITargetStatus {
+   /**
+    * @dev Constructor that disables initializers when the implementation contract is deployed.
+    * This prevents the implementation contract from being initialized, which is important for
+@@ -49,25 +52,39 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   struct Market {
+     uint256[2] votes;
+     uint256 basePrice;
++    uint256 liquidityParameter;
+   }
++
+   struct MarketInfo {
+     uint256 profileId;
+     uint256 trustVotes;
+     uint256 distrustVotes;
++    uint256 basePrice;
++    uint256 liquidityParameter;
+   }
+ 
+   /**
+    * @notice Configuration parameters for initializing new reputation markets
+    * @dev Used to define different tiers of market initialization options
+-   * @param initialLiquidity The amount of ETH required to create a market with this config
+-   * @param initialVotes The starting number of votes for both trust and distrust positions
++   * @param liquidity The LMSR liquidity parameter that controls price sensitivity
++   * @param basePrice The base price that trust and distrust vote prices will sum to (in wei)
++   * @param creationCost The amount of ETH required to create a market with this configuration
+    */
+   struct MarketConfig {
+-    uint256 initialLiquidity;
+-    uint256 initialVotes;
++    uint256 liquidity;
+     uint256 basePrice;
++    uint256 creationCost;
+   }
+ 
++  /**
++   * @notice Tracks the last known state of a market for calculating and emitting price/vote deltas
++   * @dev Used by _emitMarketUpdate to track changes between market updates
++   * @param voteTrust The last recorded number of trust votes
++   * @param voteDistrust The last recorded number of distrust votes
++   * @param positivePrice The last recorded trust vote price
++   * @param negativePrice The last recorded distrust vote price
++   * @param lastUpdateBlock The block number of the last market update
++   */
+   struct MarketUpdateInfo {
+     uint256 voteTrust;
+     uint256 voteDistrust;
+@@ -80,11 +97,6 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   uint256 public constant MINIMUM_BASE_PRICE = 0.0001 ether;
+   uint256 private constant TRUST = 1;
+   uint256 private constant DISTRUST = 0;
+-  /**
+-   * @dev The multiplier for converting slippage basis points to a percentage.
+-   * 1 basis point = 0.01%.
+-   */
+-  uint256 private constant SLIPPAGE_POINTS_BASE = 10000;
+   uint256 private constant BASIS_POINTS_BASE = 10000;
+   uint256 private constant MAX_PROTOCOL_FEE_BASIS_POINTS = 500; // 5%
+   uint256 private constant MAX_DONATION_BASIS_POINTS = 500; // 5%
+@@ -133,6 +145,11 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   // This is used to control whether anyone can create a market or only the contract admin or addresses in the allow list.
+   bool private enforceCreationAllowList;
+ 
++  // Add storage gap as the last storage variable
++  // This allows us to add new storage variables in future upgrades
++  // by reducing the size of this gap
++  uint256[50] private __gap;
++
+   event MarketCreated(uint256 indexed profileId, address indexed creator, MarketConfig config);
+   event MarketConfigAdded(uint256 indexed configIndex, MarketConfig config);
+   event MarketConfigRemoved(uint256 indexed configIndex, MarketConfig config);
+@@ -142,9 +159,7 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+     bool indexed isPositive,
+     uint256 amount,
+     uint256 funds,
+-    uint256 boughtAt,
+-    uint256 minVotePrice,
+-    uint256 maxVotePrice
++    uint256 boughtAt
+   );
+   event VotesSold(
+     uint256 indexed profileId,
+@@ -152,9 +167,7 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+     bool indexed isPositive,
+     uint256 amount,
+     uint256 funds,
+-    uint256 soldAt,
+-    uint256 minVotePrice,
+-    uint256 maxVotePrice
++    uint256 soldAt
+   );
+   event MarketUpdated(
+     uint256 indexed profileId,
+@@ -184,9 +197,8 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+    * @param profileId The ID of the market to check
+    */
+   modifier activeMarket(uint256 profileId) {
+-    if (graduatedMarkets[profileId]) {
+-      revert InactiveMarket(profileId);
+-    }
++    if (graduatedMarkets[profileId]) revert InactiveMarket(profileId);
++
+     _;
+   }
+ 
+@@ -221,11 +233,8 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+     // - 0.002 ETH initial liquidity
+     // - 1 vote each for trust/distrust (volatile price at low volume)
+     marketConfigs.push(
+-      MarketConfig({
+-        initialLiquidity: 2 * DEFAULT_PRICE,
+-        initialVotes: 1,
+-        basePrice: DEFAULT_PRICE
+-      })
++      // max votes 133,000; ~.01 ETH per vote, max market size: 1,330 ETH
++      MarketConfig({ liquidity: 1000, basePrice: DEFAULT_PRICE, creationCost: 0.2 ether })
+     );
+ 
+     // Deluxe tier
+@@ -233,11 +242,8 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+     // - 0.05 ETH initial liquidity
+     // - 1,000 votes each for trust/distrust (moderate price stability)
+     marketConfigs.push(
+-      MarketConfig({
+-        initialLiquidity: 50 * DEFAULT_PRICE,
+-        initialVotes: 1000,
+-        basePrice: DEFAULT_PRICE
+-      })
++      // max votes 1,330,000; ~.01 ETH per vote, max market size: 13,300 ETH
++      MarketConfig({ liquidity: 10000, basePrice: DEFAULT_PRICE, creationCost: 0.5 ether })
+     );
+ 
+     // Premium tier
+@@ -245,17 +251,14 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+     // - 0.1 ETH initial liquidity
+     // - 10,000 votes each for trust/distrust (highly stable price)
+     marketConfigs.push(
+-      MarketConfig({
+-        initialLiquidity: 100 * DEFAULT_PRICE,
+-        initialVotes: 10000,
+-        basePrice: DEFAULT_PRICE
+-      })
++      // max votes 13,300,000; ~.01 ETH per vote, max market size: 133,000 ETH
++      MarketConfig({ liquidity: 100000, basePrice: DEFAULT_PRICE, creationCost: 1.0 ether })
+     );
+   }
+ 
+   /**
+-   * @notice restricts upgrading to owner
+-   * @param newImplementation address of new implementation contract
++   * @notice Required override for UUPS proxy upgrade authorization
++   * @param newImplementation The address of the new implementation contract to upgrade to
+    */
+   function _authorizeUpgrade(
+     address newImplementation
+@@ -282,13 +285,13 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+     uint256 senderProfileId = _getProfileIdForAddress(msg.sender);
+ 
+     // Verify sender can create market
+-    if (enforceCreationAllowList && !creationAllowedProfileIds[senderProfileId]) {
++    if (enforceCreationAllowList && !creationAllowedProfileIds[senderProfileId])
+       revert MarketCreationUnauthorized(
+         MarketCreationErrorCode.PROFILE_NOT_AUTHORIZED,
+         msg.sender,
+         senderProfileId
+       );
+-    }
++
+     _createMarket(senderProfileId, msg.sender, marketConfigIndex);
+   }
+ 
+@@ -318,33 +321,35 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+     uint256 marketConfigIndex
+   ) private nonReentrant {
+     // ensure a market doesn't already exist for this profile
+-    if (markets[profileId].votes[TRUST] != 0 || markets[profileId].votes[DISTRUST] != 0) {
++    if (markets[profileId].votes[TRUST] != 0 || markets[profileId].votes[DISTRUST] != 0)
+       revert MarketAlreadyExists(profileId);
+-    }
+ 
+     // ensure the specified config option is valid
+-    if (marketConfigIndex >= marketConfigs.length) {
++    if (marketConfigIndex >= marketConfigs.length)
+       revert InvalidMarketConfigOption("Invalid config index");
+-    }
+ 
+-    // ensure the user has provided enough initial liquidity
+-    uint256 initialLiquidityRequired = marketConfigs[marketConfigIndex].initialLiquidity;
+-    if (msg.value < initialLiquidityRequired) {
+-      revert InsufficientInitialLiquidity();
++    uint256 creationCost = marketConfigs[marketConfigIndex].creationCost;
++
++    // Handle creation cost, refunds and market funds for non-admin users
++    if (!hasRole(ADMIN_ROLE, msg.sender)) {
++      if (msg.value < creationCost) revert InsufficientLiquidity(creationCost);
++      marketFunds[profileId] = creationCost;
++      if (msg.value > creationCost) {
++        _sendEth(msg.value - creationCost);
++      }
++    } else {
++      // when an admin creates a market, there is no minimum creation cost; use whatever they sent
++      marketFunds[profileId] = msg.value;
+     }
+ 
+     // Create the new market using the specified config
+-    markets[profileId].votes[TRUST] = marketConfigs[marketConfigIndex].initialVotes;
+-    markets[profileId].votes[DISTRUST] = marketConfigs[marketConfigIndex].initialVotes;
++    markets[profileId].votes[TRUST] = 1;
++    markets[profileId].votes[DISTRUST] = 1;
+     markets[profileId].basePrice = marketConfigs[marketConfigIndex].basePrice;
++    markets[profileId].liquidityParameter = marketConfigs[marketConfigIndex].liquidity;
+ 
+     donationRecipient[profileId] = recipient;
+ 
+-    // Tally market funds
+-    marketFunds[profileId] = initialLiquidityRequired;
+-
+-    // Refund any remaining funds
+-    _sendEth(msg.value - initialLiquidityRequired);
+     emit MarketCreated(profileId, msg.sender, marketConfigs[marketConfigIndex]);
+     _emitMarketUpdate(profileId);
+   }
+@@ -352,29 +357,23 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   // --- Market Configuration ---
+ 
+   /**
+-   * @dev Adds a new market configuration option to support different volatility preferences
+-   * @param initialLiquidity Required initial ETH (must exceed DEFAULT_PRICE)
+-   * @param initialVotes Initial vote count (higher = more stable pricing)
+-   * @return The index of the new market config
++   * @notice Adds a new market configuration option
++   * @param liquidity The LMSR liquidity parameter for the new config
++   * @param basePrice The base price for the new config (in wei)
++   * @param creationCost The ETH cost to create a market with this config
++   * @return The index of the newly added config
+    */
+   function addMarketConfig(
+-    uint256 initialLiquidity,
+-    uint256 initialVotes,
+-    uint256 basePrice
++    uint256 liquidity,
++    uint256 basePrice,
++    uint256 creationCost
+   ) public onlyAdmin whenNotPaused returns (uint256) {
+-    // minimum liquidity is at least 100% of the default price maximum; didn't need it's own constant
+-    if (initialLiquidity < DEFAULT_PRICE) revert InvalidMarketConfigOption("Min liquidity not met");
+-
+-    if (initialVotes == 0) revert InvalidMarketConfigOption("Votes cannot be zero");
++    if (liquidity < 100) revert InvalidMarketConfigOption("Min liquidity not met");
+ 
+     if (basePrice < MINIMUM_BASE_PRICE) revert InvalidMarketConfigOption("Insufficient base price");
+ 
+     marketConfigs.push(
+-      MarketConfig({
+-        initialLiquidity: initialLiquidity,
+-        initialVotes: initialVotes,
+-        basePrice: basePrice
+-      })
++      MarketConfig({ liquidity: liquidity, basePrice: basePrice, creationCost: creationCost })
+     );
+ 
+     uint256 configIndex = marketConfigs.length - 1;
+@@ -388,14 +387,10 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+    */
+   function removeMarketConfig(uint256 configIndex) public onlyAdmin whenNotPaused {
+     // Cannot remove if only one config remains
+-    if (marketConfigs.length <= 1) {
+-      revert InvalidMarketConfigOption("Must keep one config");
+-    }
++    if (marketConfigs.length <= 1) revert InvalidMarketConfigOption("Must keep one config");
+ 
+     // Check if the index is valid
+-    if (configIndex >= marketConfigs.length) {
+-      revert InvalidMarketConfigOption("index not found");
+-    }
++    if (configIndex >= marketConfigs.length) revert InvalidMarketConfigOption("index not found");
+ 
+     emit MarketConfigRemoved(configIndex, marketConfigs[configIndex]);
+ 
+@@ -410,18 +405,18 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   }
+ 
+   /**
+-   * @dev Disables the allow list enforcement
+-   * Anyone may create a market for their own profile.
+-   * @param value true if profile can create their market, false otherwise.
++   * @dev Controls whether the allow list is enforced for market creation
++   * @param value true to enforce allow list (only allowed profiles can create markets),
++   *              false to allow anyone to create a market for their own profile
+    */
+   function setAllowListEnforcement(bool value) public onlyAdmin whenNotPaused {
+     enforceCreationAllowList = value;
+   }
+ 
+   /**
+-   * @dev Sets the user's ability to create a market.
+-   * @param profileId The profileId of the user to allow/disallow market creation.
+-   * @param value is profileId allowed to create a market
++   * @notice Sets whether a specific profile is allowed to create a market
++   * @param profileId The profile ID to modify permissions for
++   * @param value True to allow market creation, false to disallow
+    */
+   function setUserAllowedToCreateMarket(
+     uint256 profileId,
+@@ -433,39 +428,47 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   // --- Core Trading Functions ---
+ 
+   /**
+-   * @dev Buys votes for a given market.
+-   * @param profileId The profileId of the market to buy votes for.
+-   * @param isPositive Whether the votes are trust or distrust.
+-   * @param expectedVotes The expected number of votes to buy. This is used as the basis for the slippage check.
+-   * @param slippageBasisPoints The slippage tolerance in basis points (1 basis point = 0.01%).
++   * @notice Buy trust or distrust votes for a market
++   * @dev Protocol fees and donations are taken from the payment amount.
++   *      Excess ETH is refunded to the buyer.
++   * @param profileId The ID of the market to buy votes in
++   * @param isPositive True to buy trust votes, false to buy distrust votes
++   * @param maxVotesToBuy Maximum number of votes to buy with the provided ETH
++   * @param minVotesToBuy Minimum acceptable number of votes (protects against slippage)
++   * @notice payable - Send ETH to cover vote cost plus fees
+    */
+   function buyVotes(
+     uint256 profileId,
+     bool isPositive,
+-    uint256 expectedVotes,
+-    uint256 slippageBasisPoints
++    uint256 maxVotesToBuy,
++    uint256 minVotesToBuy
+   ) public payable whenNotPaused activeMarket(profileId) nonReentrant {
+     _checkMarketExists(profileId);
++    // preliminary check to ensure this is enough money to buy the minimum requested votes.
++    (, , , uint256 total) = _calculateBuy(markets[profileId], isPositive, minVotesToBuy);
++    if (total > msg.value) revert InsufficientFunds();
+ 
+-    // Determine how many votes can be bought with the funds provided
+     (
+-      uint256 votesBought,
+-      uint256 fundsPaid,
+-      ,
++      uint256 purchaseCostBeforeFees,
+       uint256 protocolFee,
+       uint256 donation,
+-      uint256 minVotePrice,
+-      uint256 maxVotePrice
+-    ) = _calculateBuy(markets[profileId], isPositive, msg.value);
+-
+-    _checkSlippageLimit(votesBought, expectedVotes, slippageBasisPoints);
+-
+-    // Apply fees first
+-    applyFees(protocolFee, donation, profileId);
++      uint256 totalCostIncludingFees
++    ) = _calculateBuy(markets[profileId], isPositive, maxVotesToBuy);
++    uint256 currentVotesToBuy = maxVotesToBuy;
++    // if the cost is greater than the maximum votes to buy,
++    // decrement vote count and recalculate until we identify the max number of votes they can afford
++    while (totalCostIncludingFees > msg.value) {
++      currentVotesToBuy--;
++      (purchaseCostBeforeFees, protocolFee, donation, totalCostIncludingFees) = _calculateBuy(
++        markets[profileId],
++        isPositive,
++        currentVotesToBuy
++      );
++    }
+ 
+     // Update market state
+-    markets[profileId].votes[isPositive ? TRUST : DISTRUST] += votesBought;
+-    votesOwned[msg.sender][profileId].votes[isPositive ? TRUST : DISTRUST] += votesBought;
++    markets[profileId].votes[isPositive ? TRUST : DISTRUST] += currentVotesToBuy;
++    votesOwned[msg.sender][profileId].votes[isPositive ? TRUST : DISTRUST] += currentVotesToBuy;
+ 
+     // Add buyer to participants if not already a participant
+     if (!isParticipant[profileId][msg.sender]) {
+@@ -473,80 +476,157 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+       isParticipant[profileId][msg.sender] = true;
+     }
+ 
++    // tally market funds
++    marketFunds[profileId] += purchaseCostBeforeFees;
++
++    // Distribute the fees
++    applyFees(protocolFee, donation, profileId);
++
+     // Calculate and refund remaining funds
+-    uint256 refund = msg.value - fundsPaid;
++    uint256 refund = msg.value - totalCostIncludingFees;
+     if (refund > 0) _sendEth(refund);
+-
+-    // tally market funds
+-    marketFunds[profileId] += fundsPaid;
+     emit VotesBought(
+       profileId,
+       msg.sender,
+       isPositive,
+-      votesBought,
+-      fundsPaid,
+-      block.timestamp,
+-      minVotePrice,
+-      maxVotePrice
++      currentVotesToBuy,
++      totalCostIncludingFees,
++      block.timestamp
+     );
+     _emitMarketUpdate(profileId);
+   }
+ 
++  /**
++   * @dev Previews the cost and fees for buying votes (without executing the trade)
++   * @param market The market state to calculate costs for
++   * @param isPositive True for trust votes, false for distrust votes
++   * @param votesToBuy Number of votes to calculate cost for
++   * @return purchaseCostBeforeFees The base cost of votes before fees
++   * @return protocolFee Protocol fee amount
++   * @return donation Donation amount for market creator
++   * @return totalCostIncludingFees Total cost including all fees
++   */
++  function _calculateBuy(
++    Market memory market,
++    bool isPositive,
++    uint256 votesToBuy
++  )
++    private
++    view
++    returns (
++      uint256 purchaseCostBeforeFees,
++      uint256 protocolFee,
++      uint256 donation,
++      uint256 totalCostIncludingFees
++    )
++  {
++    // Determine the cost to purchase this many votes
++    purchaseCostBeforeFees = _calcCost(market, isPositive, true, votesToBuy);
++
++    // Preview how much fees would cost on top of the purchase cost
++    (totalCostIncludingFees, protocolFee, donation) = previewEntryFees(purchaseCostBeforeFees);
++  }
++
++  /**
++   * @notice Sell trust or distrust votes from a market
++   * @dev Protocol fees are taken from the sale proceeds.
++   *      Proceeds are sent to the seller after fees.
++   * @param profileId The ID of the market to sell votes in
++   * @param isPositive True to sell trust votes, false to sell distrust votes
++   * @param votesToSell Number of votes to sell
++   * @param minimumVotePrice Minimum acceptable price per vote (protects against slippage)
++   */
+   function sellVotes(
+     uint256 profileId,
+     bool isPositive,
+-    uint256 amount
++    uint256 votesToSell,
++    uint256 minimumVotePrice
+   ) public whenNotPaused activeMarket(profileId) nonReentrant {
+     _checkMarketExists(profileId);
++    (uint256 proceedsBeforeFees, uint256 protocolFee, uint256 proceedsAfterFees) = _calculateSell(
++      markets[profileId],
++      profileId,
++      isPositive,
++      votesToSell
++    );
+ 
+-    // calculate the amount of votes to sell and the funds received
+-    (
+-      uint256 votesSold,
+-      uint256 fundsReceived,
+-      ,
+-      uint256 protocolFee,
+-      uint256 minVotePrice,
+-      uint256 maxVotePrice
+-    ) = _calculateSell(markets[profileId], profileId, isPositive, amount);
++    uint256 pricePerVote = votesToSell > 0 ? proceedsBeforeFees / votesToSell : 0;
++    if (pricePerVote < minimumVotePrice) {
++      revert SellSlippageLimitExceeded(minimumVotePrice, pricePerVote);
++    }
+ 
+-    // update the market state
+-    markets[profileId].votes[isPositive ? TRUST : DISTRUST] -= votesSold;
+-    votesOwned[msg.sender][profileId].votes[isPositive ? TRUST : DISTRUST] -= votesSold;
++    markets[profileId].votes[isPositive ? TRUST : DISTRUST] -= votesToSell;
++    votesOwned[msg.sender][profileId].votes[isPositive ? TRUST : DISTRUST] -= votesToSell;
++    // tally market funds
++    marketFunds[profileId] -= proceedsBeforeFees;
+ 
+     // apply protocol fees
+     applyFees(protocolFee, 0, profileId);
+ 
+     // send the proceeds to the seller
+-    _sendEth(fundsReceived);
+-    // tally market funds
+-    marketFunds[profileId] -= fundsReceived;
++    _sendEth(proceedsAfterFees);
++
+     emit VotesSold(
+       profileId,
+       msg.sender,
+       isPositive,
+-      votesSold,
+-      fundsReceived,
+-      block.timestamp,
+-      minVotePrice,
+-      maxVotePrice
++      votesToSell,
++      proceedsAfterFees,
++      block.timestamp
+     );
+     _emitMarketUpdate(profileId);
+   }
+ 
++  /**
++   * @dev Previews the proceeds and fees for selling votes (without executing the trade)
++   * @param market The market state to calculate proceeds for
++   * @param profileId The ID of the market
++   * @param isPositive True for trust votes, false for distrust votes
++   * @param votesToSell Number of votes to calculate proceeds for
++   * @return proceedsBeforeFees The base proceeds before fees
++   * @return protocolFee Protocol fee amount
++   * @return proceedsAfterFees Net proceeds after fees
++   */
++  function _calculateSell(
++    Market memory market,
++    uint256 profileId,
++    bool isPositive,
++    uint256 votesToSell
++  )
++    private
++    view
++    returns (uint256 proceedsBeforeFees, uint256 protocolFee, uint256 proceedsAfterFees)
++  {
++    uint256 votesAvailable = votesOwned[msg.sender][profileId].votes[isPositive ? TRUST : DISTRUST];
++    if (votesToSell > votesAvailable) revert InsufficientVotesOwned(profileId, msg.sender);
++
++    if (market.votes[isPositive ? TRUST : DISTRUST] < votesToSell)
++      revert InsufficientVotesToSell(profileId);
++
++    // determine the proceeds from the sale
++    proceedsBeforeFees = _calcCost(market, isPositive, false, votesToSell);
++
++    // preview how many fees would be removed from the proceeds
++    (proceedsAfterFees, protocolFee) = previewExitFees(proceedsBeforeFees);
++  }
++
+   // ---Rewards & Donations---
+   /**
+-   * @dev Updates the donation recipient for a market
+-   * @notice Only the current donation recipient can update the recipient
+-   * @notice The new recipient must have the same Ethos profileId as the market
++   * @notice Updates the donation recipient for a market
++   * @dev Only callable by current recipient. New recipient must have same profileId.
++   *      Transfers any existing donation balance to the new recipient.
+    * @param profileId The profile ID of the market to update
+    * @param newRecipient The new address to receive donations
+    */
+-  function updateDonationRecipient(uint256 profileId, address newRecipient) public whenNotPaused {
++  function updateDonationRecipient(
++    uint256 profileId,
++    address newRecipient
++  ) public whenNotPaused nonReentrant {
+     if (newRecipient == address(0)) revert ZeroAddress();
+ 
+     // if the new donation recipient has a balance, do not allow overwriting
+-    // this is so rare, do we really need a custom error?
+-    require(donationEscrow[newRecipient] == 0, "Donation recipient has balance");
++    if (donationEscrow[newRecipient] != 0)
++      revert InvalidMarketConfigOption("Donation recipient has balance");
+ 
+     // Ensure the sender is the current donation recipient
+     if (msg.sender != donationRecipient[profileId]) revert InvalidProfileId();
+@@ -564,14 +644,13 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   }
+ 
+   /**
+-   * @dev Allows a user to withdraw their accumulated donations from escrow
+-   * @return amount The amount withdrawn
++   * @notice Allows a market owner to withdraw their accumulated donations
++   * @dev Transfers all donations from escrow to the caller
++   * @return The amount of ETH withdrawn
+    */
+-  function withdrawDonations() public whenNotPaused returns (uint256) {
++  function withdrawDonations() public whenNotPaused nonReentrant returns (uint256) {
+     uint256 amount = donationEscrow[msg.sender];
+-    if (amount == 0) {
+-      revert InsufficientFunds();
+-    }
++    if (amount == 0) revert InsufficientFunds();
+ 
+     // Reset escrow balance before transfer to prevent reentrancy
+     donationEscrow[msg.sender] = 0;
+@@ -591,22 +670,22 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+    * @param basisPoints The new donation percentage in basis points, maximum 500 (5%)
+    */
+   function setDonationBasisPoints(uint256 basisPoints) public onlyAdmin whenNotPaused {
+-    if (basisPoints > MAX_DONATION_BASIS_POINTS) {
++    if (basisPoints > MAX_DONATION_BASIS_POINTS)
+       revert InvalidMarketConfigOption("Donation exceeds maximum");
+-    }
++
+     donationBasisPoints = basisPoints;
+   }
+ 
+   /**
+-   * @dev Sets the protocol fee in basis points (1 basis point = 0.01%)
++   * @dev Sets the protocol fee in basis points
+    * @param basisPoints The new fee in basis points, maximum 500 (5%)
+    */
+   function setEntryProtocolFeeBasisPoints(uint256 basisPoints) public onlyAdmin whenNotPaused {
+     // must specify a protocol fee address before enabling entry fees
+     if (protocolFeeAddress == address(0)) revert ZeroAddress();
+-    if (basisPoints > MAX_PROTOCOL_FEE_BASIS_POINTS) {
++    if (basisPoints > MAX_PROTOCOL_FEE_BASIS_POINTS)
+       revert InvalidMarketConfigOption("Fee exceeds maximum");
+-    }
++
+     entryProtocolFeeBasisPoints = basisPoints;
+   }
+ 
+@@ -617,9 +696,9 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   function setExitProtocolFeeBasisPoints(uint256 basisPoints) public onlyAdmin whenNotPaused {
+     // must specify a protocol fee address before enabling exit fees
+     if (protocolFeeAddress == address(0)) revert ZeroAddress();
+-    if (basisPoints > MAX_PROTOCOL_FEE_BASIS_POINTS) {
++    if (basisPoints > MAX_PROTOCOL_FEE_BASIS_POINTS)
+       revert InvalidMarketConfigOption("Fee exceeds maximum");
+-    }
++
+     exitProtocolFeeBasisPoints = basisPoints;
+   }
+ 
+@@ -628,9 +707,8 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+    * @param newProtocolFeeAddress The address to receive protocol fees
+    */
+   function setProtocolFeeAddress(address newProtocolFeeAddress) public onlyAdmin whenNotPaused {
+-    if (newProtocolFeeAddress == address(0)) {
+-      revert ZeroAddress();
+-    }
++    if (newProtocolFeeAddress == address(0)) revert ZeroAddress();
++
+     protocolFeeAddress = newProtocolFeeAddress;
+   }
+ 
+@@ -638,39 +716,37 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+ 
+   /**
+    * @notice Graduates a market, marking it as inactive for trading
++   * @dev Only callable by the authorized Ethos graduation contract
+    * @param profileId The ID of the market to graduate
+    */
+-  function graduateMarket(uint256 profileId) public whenNotPaused activeMarket(profileId) {
++  function graduateMarket(
++    uint256 profileId
++  ) public whenNotPaused activeMarket(profileId) nonReentrant {
+     address authorizedAddress = contractAddressManager.getContractAddressForName(
+       "GRADUATION_WITHDRAWAL"
+     );
+-    if (msg.sender != authorizedAddress) {
+-      revert UnauthorizedGraduation();
+-    }
++    if (msg.sender != authorizedAddress) revert UnauthorizedGraduation();
++
+     _checkMarketExists(profileId);
+     graduatedMarkets[profileId] = true;
+     emit MarketGraduated(profileId);
+   }
+ 
+   /**
+-   * @notice Withdraws funds from a graduated market
+-   * @dev Only callable by the authorized graduation withdrawal address
++   * @notice Withdraws all funds from a graduated market
++   * @dev Only callable by the authorized Ethos graduation contract
+    * @param profileId The ID of the graduated market to withdraw from
+    */
+-  function withdrawGraduatedMarketFunds(uint256 profileId) public whenNotPaused {
++  function withdrawGraduatedMarketFunds(uint256 profileId) public whenNotPaused nonReentrant {
+     address authorizedAddress = contractAddressManager.getContractAddressForName(
+       "GRADUATION_WITHDRAWAL"
+     );
+-    if (msg.sender != authorizedAddress) {
+-      revert UnauthorizedWithdrawal();
+-    }
++    if (msg.sender != authorizedAddress) revert UnauthorizedWithdrawal();
++
+     _checkMarketExists(profileId);
+-    if (!graduatedMarkets[profileId]) {
+-      revert MarketNotGraduated();
+-    }
+-    if (marketFunds[profileId] == 0) {
+-      revert InsufficientFunds();
+-    }
++    if (!graduatedMarkets[profileId]) revert MarketNotGraduated();
++
++    if (marketFunds[profileId] == 0) revert InsufficientFunds();
+ 
+     _sendEth(marketFunds[profileId]);
+     emit MarketFundsWithdrawn(profileId, msg.sender, marketFunds[profileId]);
+@@ -680,27 +756,33 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   // --- View Functions ---
+ 
+   /**
+-   * @notice Gets the current state of a market
++   * @notice Gets the current vote counts, prices, and parameters for a market
+    * @param profileId The profile ID of the market to query
+-   * @return MarketInfo struct containing market state
++   * @return MarketInfo struct with trust/distrust votes, base price, and liquidity parameter
+    */
+   function getMarket(uint256 profileId) public view returns (MarketInfo memory) {
+     return
+       MarketInfo({
+         profileId: profileId,
+         trustVotes: markets[profileId].votes[TRUST],
+-        distrustVotes: markets[profileId].votes[DISTRUST]
++        distrustVotes: markets[profileId].votes[DISTRUST],
++        basePrice: markets[profileId].basePrice,
++        liquidityParameter: markets[profileId].liquidityParameter
+       });
+   }
+ 
++  /**
++   * @notice Gets the number of available market configurations
++   * @return The number of configurations in marketConfigs array
++   */
+   function getMarketConfigCount() public view returns (uint256) {
+     return marketConfigs.length;
+   }
+ 
+   /**
+-   * @notice Gets the number of participants in a market
++   * @notice Gets the total number of addresses that have ever held votes in a market
+    * @param profileId The profile ID of the market
+-   * @return The number of participants
++   * @return The number of historical participants (includes addresses that sold all votes)
+    */
+   function getParticipantCount(uint256 profileId) public view returns (uint256) {
+     _checkMarketExists(profileId);
+@@ -708,25 +790,27 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   }
+ 
+   /**
+-   * @notice Gets a user's vote holdings in a market
+-   * @param user The address of the user
++   * @notice Gets the number of trust and distrust votes owned by a user in a market
++   * @param user The address of the user to query
+    * @param profileId The profile ID of the market
+-   * @return MarketInfo struct containing user's vote counts
++   * @return MarketInfo struct with the user's vote counts and market parameters
+    */
+   function getUserVotes(address user, uint256 profileId) public view returns (MarketInfo memory) {
+     return
+       MarketInfo({
+         profileId: profileId,
+         trustVotes: votesOwned[user][profileId].votes[TRUST],
+-        distrustVotes: votesOwned[user][profileId].votes[DISTRUST]
++        distrustVotes: votesOwned[user][profileId].votes[DISTRUST],
++        basePrice: markets[profileId].basePrice,
++        liquidityParameter: markets[profileId].liquidityParameter
+       });
+   }
+ 
+   /**
+-   * @notice Gets the current price of votes for a market position
++   * @notice Calculates the current odds for a market position and converts them to a price using the market's base price
+    * @param profileId The profile ID of the market
+-   * @param isPositive Whether to get trust (true) or distrust (false) vote price
+-   * @return The current price per vote in wei
++   * @param isPositive Whether to get trust (true) or distrust (false) odds
++   * @return The odds converted to a price in wei (odds * basePrice)
+    */
+   function getVotePrice(uint256 profileId, bool isPositive) public view returns (uint256) {
+     _checkMarketExists(profileId);
+@@ -743,96 +827,87 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   }
+ 
+   /**
+-   * @notice Simulates buying votes to preview the transaction outcome
+-   * @dev Used to calculate expected slippage before executing a buy transaction.
+-   *      The simulation shows price impact and helps users determine appropriate
+-   *      slippage tolerance.
+-   * @param profileId The ID of the market to simulate buying from
+-   * @param isPositive Whether to buy trust (true) or distrust (false) votes
+-   * @param funds The amount of funds to simulate spending
+-   * @return votesBought The number of votes that would be received
+-   * @return fundsPaid The total amount that would be paid including fees
+-   * @return newVotePrice The new price per vote after the simulated purchase
+-   * @return protocolFee The protocol fee that would be charged
+-   * @return donation The donation amount that would be given to market owner
+-   * @return minVotePrice The minimum vote price during the transaction
+-   * @return maxVotePrice The maximum vote price during the transaction
++   * @notice Simulates buying votes to preview costs and fees without executing the trade
++   * @param profileId The profile ID of the market
++   * @param isPositive True for trust votes, false for distrust votes
++   * @param votesToBuy Number of votes to simulate buying
++   * @return purchaseCostBeforeFees The base cost of votes before fees
++   * @return protocolFee Protocol fee amount
++   * @return donation Donation amount for market creator
++   * @return totalCostIncludingFees Total cost including all fees
+    */
+   function simulateBuy(
+     uint256 profileId,
+     bool isPositive,
+-    uint256 funds
++    uint256 votesToBuy
+   )
+     public
+     view
+     activeMarket(profileId)
+     returns (
+-      uint256 votesBought,
+-      uint256 fundsPaid,
+-      uint256 newVotePrice,
++      uint256 purchaseCostBeforeFees,
+       uint256 protocolFee,
+       uint256 donation,
+-      uint256 minVotePrice,
+-      uint256 maxVotePrice
++      uint256 totalCostIncludingFees,
++      uint256 newVotePrice
+     )
+   {
+     _checkMarketExists(profileId);
+-    (
+-      votesBought,
+-      fundsPaid,
+-      newVotePrice,
+-      protocolFee,
+-      donation,
+-      minVotePrice,
+-      maxVotePrice
+-    ) = _calculateBuy(markets[profileId], isPositive, funds);
++    Market memory simulatedMarket = markets[profileId];
++
++    (purchaseCostBeforeFees, protocolFee, donation, totalCostIncludingFees) = _calculateBuy(
++      simulatedMarket,
++      isPositive,
++      votesToBuy
++    );
++    simulatedMarket.votes[isPositive ? TRUST : DISTRUST] += votesToBuy;
++    newVotePrice = _calcVotePrice(simulatedMarket, isPositive);
+   }
+ 
+   /**
+-   * @notice Simulates selling votes to preview the transaction outcome
+-   * @dev Used to calculate expected slippage before executing a sell transaction.
+-   *      The simulation shows price impact and helps users determine appropriate
+-   *      slippage tolerance.
+-   * @param profileId The ID of the market to simulate selling from
+-   * @param isPositive Whether to sell trust (true) or distrust (false) votes
+-   * @param amount The number of votes to simulate selling
+-   * @return votesSold The number of votes that would be sold
+-   * @return fundsReceived The total amount that would be received after fees
+-   * @return newVotePrice The new price per vote after the simulated sale
+-   * @return protocolFee The protocol fee that would be charged
+-   * @return minVotePrice The minimum vote price during the transaction
+-   * @return maxVotePrice The maximum vote price during the transaction
++   * @notice Simulates selling votes to preview proceeds and fees without executing the trade
++   * @param profileId The profile ID of the market
++   * @param isPositive True for trust votes, false for distrust votes
++   * @param votesToSell Number of votes to simulate selling
++   * @return proceedsBeforeFees The base proceeds before fees
++   * @return protocolFee Protocol fee amount
++   * @return proceedsAfterFees Net proceeds after fees
+    */
+   function simulateSell(
+     uint256 profileId,
+     bool isPositive,
+-    uint256 amount
++    uint256 votesToSell
+   )
+     public
+     view
+     activeMarket(profileId)
+     returns (
+-      uint256 votesSold,
+-      uint256 fundsReceived,
+-      uint256 newVotePrice,
++      uint256 proceedsBeforeFees,
+       uint256 protocolFee,
+-      uint256 minVotePrice,
+-      uint256 maxVotePrice
++      uint256 proceedsAfterFees,
++      uint256 newVotePrice
+     )
+   {
+     _checkMarketExists(profileId);
+-    (
+-      votesSold,
+-      fundsReceived,
+-      newVotePrice,
+-      protocolFee,
+-      minVotePrice,
+-      maxVotePrice
+-    ) = _calculateSell(markets[profileId], profileId, isPositive, amount);
++    Market memory simulatedMarket = markets[profileId];
++
++    (proceedsBeforeFees, protocolFee, proceedsAfterFees) = _calculateSell(
++      simulatedMarket,
++      profileId,
++      isPositive,
++      votesToSell
++    );
++    simulatedMarket.votes[isPositive ? TRUST : DISTRUST] -= votesToSell;
++    newVotePrice = _calcVotePrice(simulatedMarket, isPositive);
+   }
+ 
+   // --- Internal Helper Functions ---
+ 
++  /**
++   * @notice Emits an event with the current market state and changes since last update
++   * @dev Tracks changes in vote counts and prices between market updates
++   * @param profileId The profile ID of the market to update
++   */
+   function _emitMarketUpdate(uint256 profileId) private {
+     _checkMarketExists(profileId);
+     uint256 currentPositivePrice = getVotePrice(profileId, true);
+@@ -884,13 +959,12 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   }
+ 
+   /**
+-   * @notice Sends ETH to the message sender
+-   * @param amount The amount of ETH to send
+-   * @dev Reverts if the transfer fails
++   * @notice Sends ETH to msg.sender
++   * @param amount Amount of ETH to send in wei
+    */
+   function _sendEth(uint256 amount) private {
+     (bool success, ) = payable(msg.sender).call{ value: amount }("");
+-    require(success, "ETH transfer failed");
++    if (!success) revert FeeTransferFailed("ETH transfer failed");
+   }
+ 
+   /**
+@@ -899,13 +973,11 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+    * @return profileId The verified profile ID for the address
+    */
+   function _getProfileIdForAddress(address userAddress) private view returns (uint256) {
+-    if (userAddress == address(0)) {
+-      revert ZeroAddressNotAllowed();
+-    }
++    if (userAddress == address(0)) revert ZeroAddressNotAllowed();
++
+     uint256 profileId = _ethosProfileContract().verifiedProfileIdForAddress(userAddress);
+-    if (profileId == 0) {
+-      revert InvalidProfileId();
+-    }
++    if (profileId == 0) revert InvalidProfileId();
++
+     return profileId;
+   }
+ 
+@@ -918,182 +990,81 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+    * @return The calculated vote price
+    */
+   function _calcVotePrice(Market memory market, bool isPositive) private pure returns (uint256) {
+-    uint256 totalVotes = market.votes[TRUST] + market.votes[DISTRUST];
+-    return (market.votes[isPositive ? TRUST : DISTRUST] * market.basePrice) / totalVotes;
++    // odds are in a ratio of N / 1e18
++    uint256 odds = LMSR.getOdds(
++      market.votes[TRUST],
++      market.votes[DISTRUST],
++      market.liquidityParameter,
++      isPositive
++    );
++    // multiply odds by base price to get price; divide by 1e18 to get price in wei
++    // round up for trust, down for distrust so that prices always equal basePrice
++    return
++      odds.mulDiv(market.basePrice, 1e18, isPositive ? Math.Rounding.Floor : Math.Rounding.Ceil);
+   }
+ 
+   /**
+-   * @notice Calculates the outcome of a buy transaction
+-   * @dev Simulates the entire buy process including:
+-   *      - Price impact calculation using bonding curve
+-   *      - Fee calculations (protocol fee and donation)
+-   *      - Slippage protection via min/max price tracking
+-   * @param market Current market state
+-   * @param isPositive Whether buying trust (true) or distrust (false) votes
+-   * @param funds Amount of ETH being spent
+-   * @return votesBought Number of votes that will be received
+-   * @return fundsPaid Total amount paid including fees
+-   * @return newVotePrice Final price per vote after purchase
+-   * @return protocolFee Protocol fee amount
+-   * @return donation Donation amount for market owner
+-   * @return minVotePrice Minimum price during transaction
+-   * @return maxVotePrice Maximum price during transaction
++   * @notice Calculates the cost of a trade using LMSR cost function
++   * @dev The cost of a trade is the difference between:
++   *      - Cost after the trade (with updated vote counts)
++   *      - Cost before the trade (with current vote counts)
++   * @param market The market state to calculate cost for
++   * @param isPositive Whether to calculate for trust (true) or distrust (false) votes
++   * @param isBuy True for buying votes, false for selling votes
++   * @param amount Number of votes to buy or sell
++   * @return cost The difference in LMSR costs scaled by basePrice
+    */
+-  function _calculateBuy(
++  function _calcCost(
+     Market memory market,
+     bool isPositive,
+-    uint256 funds
+-  )
+-    private
+-    view
+-    returns (
+-      uint256 votesBought,
+-      uint256 fundsPaid,
+-      uint256 newVotePrice,
+-      uint256 protocolFee,
+-      uint256 donation,
+-      uint256 minVotePrice,
+-      uint256 maxVotePrice
+-    )
+-  {
+-    uint256 fundsAvailable;
+-    (fundsAvailable, protocolFee, donation) = previewFees(funds, true);
+-    uint256 votePrice = _calcVotePrice(market, isPositive);
+-
+-    uint256 minPrice = votePrice;
+-    uint256 maxPrice;
+-
+-    if (fundsAvailable < votePrice) {
+-      revert InsufficientFunds();
+-    }
+-
+-    while (fundsAvailable >= votePrice) {
+-      fundsAvailable -= votePrice;
+-      fundsPaid += votePrice;
+-      votesBought++;
+-
+-      market.votes[isPositive ? TRUST : DISTRUST] += 1;
+-      votePrice = _calcVotePrice(market, isPositive);
+-    }
+-    fundsPaid += protocolFee + donation;
+-
+-    maxPrice = votePrice;
+-
+-    return (votesBought, fundsPaid, votePrice, protocolFee, donation, minPrice, maxPrice);
+-  }
+-
+-  /**
+-   * @notice Calculates the outcome of a sell transaction
+-   * @dev Simulates the entire sell process including:
+-   *      - Price impact calculation using bonding curve
+-   *      - Fee calculations (protocol fee only, no donation on sells)
+-   *      - Slippage protection via min/max price tracking
+-   *      - Prevents selling when market would be depleted
+-   * @param market Current market state
+-   * @param profileId ID of the market
+-   * @param isPositive Whether selling trust (true) or distrust (false) votes
+-   * @param amount Number of votes to sell
+-   * @return votesSold Number of votes that will be sold
+-   * @return fundsReceived Amount received after fees
+-   * @return newVotePrice Final price per vote after sale
+-   * @return protocolFee Protocol fee amount
+-   * @return minVotePrice Minimum price during transaction
+-   * @return maxVotePrice Maximum price during transaction
+-   */
+-  function _calculateSell(
+-    Market memory market,
+-    uint256 profileId,
+-    bool isPositive,
++    bool isBuy,
+     uint256 amount
+-  )
+-    private
+-    view
+-    returns (
+-      uint256 votesSold,
+-      uint256 fundsReceived,
+-      uint256 newVotePrice,
+-      uint256 protocolFee,
+-      uint256 minVotePrice,
+-      uint256 maxVotePrice
+-    )
+-  {
+-    uint256 votesAvailable = votesOwned[msg.sender][profileId].votes[isPositive ? TRUST : DISTRUST];
+-
+-    if (votesAvailable < amount) {
+-      revert InsufficientVotesOwned(profileId, msg.sender);
+-    }
+-
+-    uint256 votePrice = _calcVotePrice(market, isPositive);
+-
+-    uint256 maxPrice = votePrice;
+-    uint256 minPrice;
+-
+-    while (votesSold < amount) {
+-      if (market.votes[isPositive ? TRUST : DISTRUST] <= 1) {
+-        revert InsufficientVotesToSell(profileId);
++  ) private pure returns (uint256 cost) {
++    // cost ratio is a unitless ratio of N / 1e18
++    uint256[] memory voteDelta = new uint256[](2);
++    // convert boolean input into market state change
++    if (isBuy) {
++      if (isPositive) {
++        voteDelta[0] = market.votes[TRUST] + amount;
++        voteDelta[1] = market.votes[DISTRUST];
++      } else {
++        voteDelta[0] = market.votes[TRUST];
++        voteDelta[1] = market.votes[DISTRUST] + amount;
++      }
++    } else {
++      if (isPositive) {
++        voteDelta[0] = market.votes[TRUST] - amount;
++        voteDelta[1] = market.votes[DISTRUST];
++      } else {
++        voteDelta[0] = market.votes[TRUST];
++        voteDelta[1] = market.votes[DISTRUST] - amount;
+       }
+-
+-      market.votes[isPositive ? TRUST : DISTRUST] -= 1;
+-      votePrice = _calcVotePrice(market, isPositive);
+-      fundsReceived += votePrice;
+-      votesSold++;
+     }
+-    (fundsReceived, protocolFee, ) = previewFees(fundsReceived, false);
+-    minPrice = votePrice;
+ 
+-    return (votesSold, fundsReceived, votePrice, protocolFee, minPrice, maxPrice);
++    int256 costRatio = LMSR.getCost(
++      market.votes[TRUST],
++      market.votes[DISTRUST],
++      voteDelta[0],
++      voteDelta[1],
++      market.liquidityParameter
++    );
++
++    uint256 positiveCostRatio = costRatio > 0 ? uint256(costRatio) : uint256(costRatio * -1);
++    // multiply cost ratio by base price to get cost; divide by 1e18 to apply ratio
++    cost = positiveCostRatio.mulDiv(
++      market.basePrice,
++      1e18,
++      isPositive ? Math.Rounding.Floor : Math.Rounding.Ceil
++    );
+   }
+ 
+-  /* @notice Verifies a market exists for the given profile ID
+-   * @param profileId The ID of the profile to check
+-   * @dev Required before any market interaction to prevent operations on non-existent markets
++  /**
++   * @notice Reverts if no market exists for the given profile ID
++   * @param profileId The profile ID to check
+    */
+   function _checkMarketExists(uint256 profileId) private view {
+-    if (markets[profileId].votes[TRUST] == 0 && markets[profileId].votes[DISTRUST] == 0) {
++    if (markets[profileId].votes[TRUST] == 0 && markets[profileId].votes[DISTRUST] == 0)
+       revert MarketDoesNotExist(profileId);
+-    }
+-  }
+-
+-  /* @notice Verifies a profile exists and is active in the Ethos Profile system
+-   * @param profileId The ID of the profile to check
+-   * @dev Prevents market operations involving invalid or archived profiles
+-   */
+-  function _checkProfileExists(uint256 profileId) private view {
+-    if (profileId == 0) {
+-      revert InvalidProfileId();
+-    }
+-    (bool exists, bool archived) = _ethosProfileContract().profileExistsAndArchivedForId(profileId);
+-    if (!exists || archived) {
+-      revert InvalidProfileId();
+-    }
+-  }
+-
+-  /* @notice Gets the caller's verified Ethos profile ID
+-   * @return The profile ID for msg.sender
+-   */
+-  function _checkAddressHasProfile() private view returns (uint256) {
+-    return _ethosProfileContract().verifiedProfileIdForAddress(msg.sender);
+-  }
+-
+-  /* @notice Validates that received votes meet minimum expectations
+-   * @param actual Actual votes received from transaction
+-   * @param expected Expected votes to receive
+-   * @param slippageBasisPoints Maximum allowed slippage (1 basis point = 0.01%)
+-   * @dev Protects users from receiving fewer votes than expected due to price movement
+-   */
+-  function _checkSlippageLimit(
+-    uint256 actual,
+-    uint256 expected,
+-    uint256 slippageBasisPoints
+-  ) private pure {
+-    uint256 minimumVotes = expected.mulDiv(
+-      SLIPPAGE_POINTS_BASE - slippageBasisPoints,
+-      SLIPPAGE_POINTS_BASE,
+-      Math.Rounding.Ceil
+-    );
+-    if (actual < minimumVotes) {
+-      revert SlippageLimitExceeded(actual, expected, slippageBasisPoints);
+-    }
+   }
+ 
+   /* @notice Gets interface for interacting with Ethos Profile system
+@@ -1105,13 +1076,12 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+ 
+   /**
+    * @notice Processes protocol fees and donations for a market transaction
+-   * @dev Handles both protocol fee transfer and donation escrow updates.
+-   *      Protocol fees go to protocol fee address immediately.
+-   *      Donations are held in escrow until withdrawn by recipient.
++   * @dev Protocol fees are sent immediately to the protocol fee address
++   *      Donations are stored in escrow until withdrawn by the market owner
+    * @param protocolFee Amount of protocol fee to collect
+    * @param donation Amount to add to donation escrow
+-   * @param marketOwnerProfileId Profile ID of market owner receiving donation
+-   * @return fees Total fees processed
++   * @param marketOwnerProfileId Profile ID of market owner who will receive the donation
++   * @return fees Total amount of fees processed (protocol fee + donation)
+    */
+   function applyFees(
+     uint256 protocolFee,
+@@ -1127,27 +1097,46 @@ contract ReputationMarket is AccessControl, UUPSUpgradeable, ReentrancyGuard {
+   }
+ 
+   /**
+-   * @notice Calculates fees for a market transaction
+-   * @dev Entry transactions (buys) incur both protocol fees and donations
+-   *      Exit transactions (sells) only incur protocol fees
+-   *      Fees are calculated in basis points (1 basis point = 0.01%)
+-   *      Maximum fee limits are enforced
+-   * @param amount Transaction amount to calculate fees for
+-   * @param isEntry True for buy transactions, false for sell transactions
+-   * @return funds Amount after fees deducted
+-   * @return protocolFee Protocol fee amount
+-   * @return donation Donation amount for market owner
++   * @notice Calculates the protocol fee and donation amounts for a market entry (buy) transaction
++   * @param fundsBeforeFees The base amount to calculate fees from
++   * @return totalCostIncludingFees The total cost including protocol fee and donation
++   * @return protocolFee The protocol fee amount
++   * @return donation The donation amount for market creator
+    */
+-  function previewFees(
+-    uint256 amount,
+-    bool isEntry
+-  ) private view returns (uint256 funds, uint256 protocolFee, uint256 donation) {
+-    if (isEntry) {
+-      protocolFee = (amount * entryProtocolFeeBasisPoints) / BASIS_POINTS_BASE;
+-      donation = (amount * donationBasisPoints) / BASIS_POINTS_BASE;
+-    } else {
+-      protocolFee = (amount * exitProtocolFeeBasisPoints) / BASIS_POINTS_BASE;
+-    }
+-    funds = amount - protocolFee - donation;
++  function previewEntryFees(
++    uint256 fundsBeforeFees
++  ) private view returns (uint256 totalCostIncludingFees, uint256 protocolFee, uint256 donation) {
++    protocolFee = (fundsBeforeFees * entryProtocolFeeBasisPoints) / BASIS_POINTS_BASE;
++    donation = (fundsBeforeFees * donationBasisPoints) / BASIS_POINTS_BASE;
++    totalCostIncludingFees = fundsBeforeFees + protocolFee + donation;
++  }
++
++  /**
++   * @notice Calculates the protocol fee for a market exit (sell) transaction
++   * @param proceedsBeforeFees The base proceeds to calculate fees from
++   * @return totalProceedsAfterFees The net proceeds after subtracting protocol fee
++   * @return protocolFee The protocol fee amount
++   */
++  function previewExitFees(
++    uint256 proceedsBeforeFees
++  ) private view returns (uint256 totalProceedsAfterFees, uint256 protocolFee) {
++    protocolFee = (proceedsBeforeFees * exitProtocolFeeBasisPoints) / BASIS_POINTS_BASE;
++    totalProceedsAfterFees = proceedsBeforeFees - protocolFee;
++  }
++
++  /**
++   * @dev Checks whether market exists and is allowed to be used for replies and upvotes
++   * @param targetId Market profile id
++   * @return exists Whether market exists
++   * @return allowed Whether market is allowed to be used
++   */
++  function targetExistsAndAllowedForId(
++    uint256 targetId
++  ) external view returns (bool exists, bool allowed) {
++    // A market exists if it has any votes (either trust or distrust)
++    exists = markets[targetId].votes[TRUST] != 0 || markets[targetId].votes[DISTRUST] != 0;
++
++    // A market is open for replies and votes if it exists and hasn't been graduated
++    allowed = exists && !graduatedMarkets[targetId];
+   }
+ }

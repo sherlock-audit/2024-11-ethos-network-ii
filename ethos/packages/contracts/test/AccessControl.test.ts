@@ -16,8 +16,6 @@ const smartContractNames = {
   signatureVerifier: 'ETHOS_SIGNATURE_VERIFIER',
   vote: 'ETHOS_VOTE',
   vouch: 'ETHOS_VOUCH',
-  vaultManager: 'ETHOS_VAULT_MANAGER',
-  slashPenalty: 'ETHOS_SLASH_PENALTY',
 } as const;
 
 describe('AccessControl', () => {

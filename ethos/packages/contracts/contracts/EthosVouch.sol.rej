@@ -1,0 +1,730 @@
+diff a/ethos/packages/contracts/contracts/EthosVouch.sol b/ethos/packages/contracts/contracts/EthosVouch.sol	(rejected hunks)
+@@ -1,6 +1,5 @@
+ // SPDX-License-Identifier: MIT
+ pragma solidity 0.8.26;
+-
+ import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+ import { ITargetStatus } from "./interfaces/ITargetStatus.sol";
+ import { IEthosProfile } from "./interfaces/IEthosProfile.sol";
+@@ -117,8 +116,10 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+ 
+   // --- Constants ---
+   uint256 private constant ABSOLUTE_MINIMUM_VOUCH_AMOUNT = 0.0001 ether;
+-  uint256 public constant MAX_TOTAL_FEES = 10000;
++  // 1000 basis points = 10% max fees
++  uint256 public constant MAX_TOTAL_FEES = 1000;
+   uint256 public constant BASIS_POINT_SCALE = 10000;
++  // 1000 basis points = 10% max slash
+   uint256 public constant MAX_SLASH_PERCENTAGE = 1000;
+ 
+   // --- State Variables ---
+@@ -179,7 +180,28 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+    * @notice Maps profile IDs to their rewards balance in ETH
+    * @dev Balances are Eth only; no ERC20 support. Maps Ethos profile IDs to their rewards balances.
+    */
+-  mapping(uint256 => uint256) public rewards;
++  mapping(uint256 => uint256) public rewardsByProfileId;
++  /**
++   * @notice Maps attestation hashes to their rewards balance
++   * Only used when vouching for mock profiles
++   */
++  mapping(bytes32 => uint256) public rewardsByAttestationHash;
++  /**
++   * @notice Maps address to their rewards balance
++   * Only used when vouching for mock profiles
++   */
++  mapping(address => uint256) public rewardsByAddress;
++
++  /*
++   * @notice Maps author profile IDs to their frozen status, preventing withdrawals before slashing
++   * @dev authorProfileId => isFrozen
++   */
++  mapping(uint256 => bool) public frozenAuthors;
++
++  // Add storage gap as the last storage variable
++  // This allows us to add new storage variables in future upgrades
++  // by reducing the size of this gap
++  uint256[50] private __gap;
+ 
+   // --- Error Codes ---
+   error InvalidEthosProfileForVouch(uint256 ethosProfileId);
+@@ -188,10 +210,8 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+   error VouchNotFound(uint256 vouchId);
+   error NotAuthorForVouch(uint256 vouchId, uint256 user);
+   error WrongSubjectProfileIdForVouch(uint256 vouchId, uint256 subjectProfileId);
+-  error WithdrawalFailed(bytes data, string message);
+   error CannotMarkVouchAsUnhealthy(uint256 vouchId);
+   error AlreadyUnvouched(uint256 vouchId);
+-  error ETHTransferFailed();
+   error InvalidFeeMultiplier(uint256 newFee);
+   error MinimumVouchAmount(uint256 amount);
+   error AddressNotVouchAuthor(uint256 vouchId, address caller, address author);
+@@ -203,26 +223,35 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+   error InvalidSlashPercentage();
+   error InvalidFeeProtocolAddress();
+   error NotSlasher();
++  error InvalidAttestationHash(bytes32 attestationHash);
++  error PendingSlash(uint256 vouchId, uint256 authorProfileId);
+ 
+   // --- Events ---
+   event Vouched(
+     uint256 indexed vouchId,
+     uint256 indexed authorProfileId,
+     uint256 indexed subjectProfileId,
+-    uint256 amountStaked
++    address subjectAddress,
++    bytes32 attestationHash,
++    uint256 amountStaked,
++    uint256 amountDeposited
+   );
+ 
+   event VouchIncreased(
+     uint256 indexed vouchId,
+     uint256 indexed authorProfileId,
+     uint256 indexed subjectProfileId,
+-    uint256 amountStaked
++    address subjectAddress,
++    bytes32 attestationHash,
++    uint256 amountStaked,
++    uint256 amountDeposited
+   );
+ 
+   event Unvouched(
+     uint256 indexed vouchId,
+     uint256 indexed authorProfileId,
+-    uint256 indexed subjectProfileId
++    uint256 indexed subjectProfileId,
++    uint256 amountWithdrawn
+   );
+ 
+   event MarkedUnhealthy(
+@@ -238,6 +267,7 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+   event DepositedToRewards(uint256 indexed recipientProfileId, uint256 amount);
+   event WithdrawnFromRewards(uint256 indexed accountProfileId, uint256 amount);
+   event Slashed(uint256 indexed authorProfileId, uint256 slashBasisPoints, uint256 totalSlashed);
++  event Frozen(uint256 indexed authorProfileId, bool isFrozen);
+ 
+   /**
+    * @notice Modifier to restrict access to slasher contract only
+@@ -301,41 +331,101 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+   // --- Vouch Functions ---
+ 
+   /**
+-   * @dev Vouches for address.
+-   * @param subjectAddress Vouchee address.
+-   * @param comment Comment.
+-   * @param metadata Metadata.
++   * @notice Vouches by address, allowing vouches for addresses that have not yet joined Ethos (mock profiles)
++   * @param subjectAddress The address to vouch for
++   * @param comment Optional text comment about the vouch
++   * @param metadata Additional structured metadata about the vouch
+    */
+   function vouchByAddress(
+     address subjectAddress,
+     string calldata comment,
+     string calldata metadata
+-  ) public payable onlyNonZeroAddress(subjectAddress) whenNotPaused {
+-    IEthosProfile profile = IEthosProfile(
+-      contractAddressManager.getContractAddressForName(ETHOS_PROFILE)
++  ) public payable onlyNonZeroAddress(subjectAddress) whenNotPaused nonReentrant {
++    (bool verified, bool archived, bool mock, uint256 subjectProfileId) = _ethosProfile()
++      .profileStatusByAddress(subjectAddress);
++
++    // you may not vouch for archived profiles
++    if (archived) revert InvalidEthosProfileForVouch(subjectProfileId);
++    // if verified, use the standard vouchByProfileId
++    if (verified) {
++      _vouchByProfileIdCommon(subjectProfileId, comment, metadata);
++      return;
++    }
++    // use vouchByAddress or vouchByAttestationHash for mock profiles
++    if (!mock) revert InvalidEthosProfileForVouch(subjectProfileId);
++
++    _vouchCommon(subjectProfileId, comment, metadata, bytes32(0), subjectAddress);
++  }
++
++  /**
++   * @notice Vouches by attestation hash, allowing vouches for social accounts that have not yet joined Ethos (mock profiles)
++   * @param attestationHash The attestation hash identifying the subject to vouch for
++   * @param comment Optional text comment about the vouch
++   * @param metadata Additional structured metadata about the vouch
++   */
++  function vouchByAttestation(
++    bytes32 attestationHash,
++    string calldata comment,
++    string calldata metadata
++  ) public payable whenNotPaused nonReentrant {
++    uint256 attestationProfileId = _ethosProfile().profileIdByAttestation(attestationHash);
++    // submitted hash must match the mock profile attestation hash
++    (bool verified, bool archived, bool mock) = _ethosProfile().profileStatusById(
++      attestationProfileId
+     );
+-    profile.verifiedProfileIdForAddress(msg.sender);
+ 
+-    uint256 profileId = profile.profileIdByAddress(subjectAddress);
++    // you may not vouch for archived profiles
++    if (archived) revert InvalidEthosProfileForVouch(attestationProfileId);
++    // this function is only for mock profiles
++    if (verified) {
++      _vouchByProfileIdCommon(attestationProfileId, comment, metadata);
++      return;
++    }
++    // use vouchByAddress or vouchByAttestationHash for verified profiles
++    if (!mock) revert InvalidEthosProfileForVouch(attestationProfileId);
+ 
+-    vouchByProfileId(profileId, comment, metadata);
++    _vouchCommon(attestationProfileId, comment, metadata, attestationHash, address(0));
+   }
+ 
+   /**
+-   * @dev Vouches for profile Id.
+-   * @param subjectProfileId Subject profile Id.
+-   * @param comment Comment.
+-   * @param metadata Metadata.
++   * @notice Vouches by profile ID, allowing vouches for existing Ethos profiles
++   * @param subjectProfileId The profile ID to vouch for
++   * @param comment Optional text comment about the vouch
++   * @param metadata Additional structured metadata about the vouch
+    */
+   function vouchByProfileId(
+     uint256 subjectProfileId,
+     string calldata comment,
+     string calldata metadata
+-  ) public payable whenNotPaused nonReentrant {
+-    // validate author profile
+-    uint256 authorProfileId = IEthosProfile(
+-      contractAddressManager.getContractAddressForName(ETHOS_PROFILE)
+-    ).verifiedProfileIdForAddress(msg.sender);
++  ) external payable whenNotPaused nonReentrant {
++    _vouchByProfileIdCommon(subjectProfileId, comment, metadata);
++  }
++
++  function _vouchByProfileIdCommon(
++    uint256 subjectProfileId,
++    string calldata comment,
++    string calldata metadata
++  ) internal {
++    (bool verified, bool archived, bool mock) = _ethosProfile().profileStatusById(subjectProfileId);
++
++    // this function is only for verified profiles
++    if (!verified) revert InvalidEthosProfileForVouch(subjectProfileId);
++    // you may not vouch for archived profiles
++    if (archived) revert InvalidEthosProfileForVouch(subjectProfileId);
++    // use vouchByAddress or vouchByAttestationHash for mock profiles
++    if (mock) revert InvalidEthosProfileForVouch(subjectProfileId);
++
++    _vouchCommon(subjectProfileId, comment, metadata, bytes32(0), address(0));
++  }
++
++  function _vouchCommon(
++    uint256 subjectProfileId,
++    string calldata comment,
++    string calldata metadata,
++    bytes32 attestationHash,
++    address subjectAddress
++  ) internal {
++    uint256 authorProfileId = _ethosProfile().verifiedProfileIdForAddress(msg.sender);
+ 
+     // pls no vouch for yourself
+     if (authorProfileId == subjectProfileId) {
+@@ -351,19 +441,7 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+     }
+ 
+     // validate subject profile
+-    if (subjectProfileId == 0) {
+-      revert InvalidEthosProfileForVouch(subjectProfileId);
+-    }
+-    (bool verified, bool archived, bool mock) = IEthosProfile(
+-      contractAddressManager.getContractAddressForName(ETHOS_PROFILE)
+-    ).profileStatusById(subjectProfileId);
+-
+-    // you may not vouch for archived profiles
+-    // however, you may vouch for verified AND mock profiles
+-    // we allow vouching for mock profiles in case they are later verified
+-    if (archived || (!mock && !verified)) {
+-      revert InvalidEthosProfileForVouch(subjectProfileId);
+-    }
++    if (subjectProfileId == 0) revert InvalidEthosProfileForVouch(subjectProfileId);
+ 
+     // one vouch per profile per author
+     _vouchShouldNotExistFor(authorProfileId, subjectProfileId);
+@@ -381,7 +459,13 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+       revert MinimumVouchAmount(configuredMinimumVouchAmount);
+     }
+ 
+-    (uint256 toDeposit, ) = applyFees(msg.value, true, subjectProfileId);
++    (uint256 toDeposit, ) = applyEntryFees(
++      msg.value,
++      subjectProfileId,
++      authorProfileId,
++      attestationHash,
++      subjectAddress
++    );
+ 
+     // store vouch details
+     uint256 count = vouchCount;
+@@ -410,49 +494,95 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+       })
+     });
+ 
+-    emit Vouched(count, authorProfileId, subjectProfileId, msg.value);
++    emit Vouched(
++      count,
++      authorProfileId,
++      subjectProfileId,
++      subjectAddress,
++      attestationHash,
++      msg.value,
++      toDeposit
++    );
+     vouchCount++;
+   }
+ 
+   /**
+-   * @notice Increases the amount staked for an existing vouch
+-
++   * @notice Increases the staked amount for an existing vouch
+    * @param vouchId The ID of the vouch to increase
+-
+-   * @custom:throws {NotAuthorForVouch} If the caller is not the author of the vouch
+-   * @custom:throws {AlreadyUnvouched} If the vouch has already been unvouched
+-   * @custom:emits VouchIncreased
++   * @param attestationHash Optional mock profile attestation hash (use bytes32(0) if not needed)
++   * @param subjectAddress Optional mock profile address (use address(0) if not needed)
++   * @dev For verified profiles, both attestationHash and subjectAddress should be empty
++   * @dev For mock profiles, either attestationHash OR subjectAddress must match the original vouch
+    */
+-  function increaseVouch(uint256 vouchId) public payable nonReentrant {
++  function increaseVouch(
++    uint256 vouchId,
++    bytes32 attestationHash,
++    address subjectAddress
++  ) public payable nonReentrant {
+     // vouch increases much also meet the minimum vouch amount
+     if (msg.value < configuredMinimumVouchAmount) {
+       revert MinimumVouchAmount(configuredMinimumVouchAmount);
+     }
+     // get the profile id of the author
+-    uint256 profileId = IEthosProfile(
+-      contractAddressManager.getContractAddressForName(ETHOS_PROFILE)
+-    ).verifiedProfileIdForAddress(msg.sender);
+-    _vouchShouldBelongToAuthor(vouchId, profileId);
++    uint256 authorProfileId = _ethosProfile().verifiedProfileIdForAddress(msg.sender);
++    _vouchShouldBelongToAuthor(vouchId, authorProfileId);
+     // make sure this vouch is active; not unvouched
+     _vouchShouldBePossibleUnvouch(vouchId);
+ 
+     uint256 subjectProfileId = vouches[vouchId].subjectProfileId;
+-    (uint256 toDeposit, ) = applyFees(msg.value, true, subjectProfileId);
++
++    // If the subject profile is a mock profile, require a subject address or attestation hash
++    (, , bool mock) = _ethosProfile().profileStatusById(subjectProfileId);
++    if (mock && (subjectAddress == address(0) && attestationHash == bytes32(0)))
++      revert InvalidEthosProfileForVouch(subjectProfileId);
++
++    // Validate that either attestationHash or subjectAddress matches the vouch
++    if (attestationHash != bytes32(0)) {
++      uint256 attestationProfileId = _ethosProfile().profileIdByAttestation(attestationHash);
++      if (attestationProfileId != subjectProfileId)
++        revert InvalidEthosProfileForVouch(attestationProfileId);
++    }
++
++    if (subjectAddress != address(0)) {
++      uint256 addressProfileId = _ethosProfile().profileIdByAddress(subjectAddress);
++      if (addressProfileId != subjectProfileId)
++        revert InvalidEthosProfileForVouch(addressProfileId);
++    }
++
++    (uint256 toDeposit, ) = applyEntryFees(
++      msg.value,
++      subjectProfileId,
++      authorProfileId,
++      attestationHash,
++      subjectAddress
++    );
+     vouches[vouchId].balance += toDeposit;
+ 
+-    emit VouchIncreased(vouchId, profileId, subjectProfileId, msg.value);
++    emit VouchIncreased(
++      vouchId,
++      authorProfileId,
++      subjectProfileId,
++      subjectAddress,
++      attestationHash,
++      msg.value,
++      toDeposit
++    );
+   }
+ 
+   // --- Unvouch Functions ---
+ 
+   /**
+-   * @dev Unvouches vouch.
+-   * @param vouchId Vouch Id.
++   * @notice Withdraws a vouch, returning staked funds to the author minus exit fees
++   * @param vouchId The ID of the vouch to withdraw
+    */
+   function unvouch(uint256 vouchId) public whenNotPaused nonReentrant {
+     Vouch storage v = vouches[vouchId];
+     _vouchShouldExist(vouchId);
+     _vouchShouldBePossibleUnvouch(vouchId);
++
++    // Prevent withdrawals if the author's profile is frozen
++    if (frozenAuthors[v.authorProfileId]) revert PendingSlash(vouchId, v.authorProfileId);
++
+     // because it's $$$, you can only withdraw/unvouch to the same address you used to vouch
+     // however, we don't care about the status of the address's profile; funds are always attached
+     // to an address, not a profile
+@@ -467,7 +597,7 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+     _removeVouchFromArrays(v);
+ 
+     // apply fees and determine how much is left to send back to the author
+-    (uint256 toWithdraw, ) = applyFees(v.balance, false, v.subjectProfileId);
++    (uint256 toWithdraw, ) = applyExitFees(v.balance);
+     // set the balance to 0 and save back to storage
+     v.balance = 0;
+     // send the funds to the author
+@@ -477,7 +607,7 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+       revert FeeTransferFailed("Failed to send ETH to author");
+     }
+ 
+-    emit Unvouched(v.vouchId, v.authorProfileId, v.subjectProfileId);
++    emit Unvouched(v.vouchId, v.authorProfileId, v.subjectProfileId, toWithdraw);
+   }
+ 
+   /**
+@@ -495,9 +625,7 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+    */
+   function markUnhealthy(uint256 vouchId) public whenNotPaused {
+     Vouch storage v = vouches[vouchId];
+-    uint256 profileId = IEthosProfile(
+-      contractAddressManager.getContractAddressForName(ETHOS_PROFILE)
+-    ).verifiedProfileIdForAddress(msg.sender);
++    uint256 profileId = _ethosProfile().verifiedProfileIdForAddress(msg.sender);
+ 
+     _vouchShouldExist(vouchId);
+     _vouchShouldBePossibleUnhealthy(vouchId);
+@@ -511,6 +639,27 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+ 
+   // --- Slash Functions ---
+ 
++  /**
++   * @notice Freezes all vouches from a specific author, preventing withdrawals until unfrozen or slashed
++   * @dev Only callable by the authorized slasher contract
++   * @param authorProfileId The profile ID whose vouches will be frozen
++   * This is a protective measure to prevent withdrawal of funds during investigation before the slashing process is complete
++   */
++  function freeze(uint256 authorProfileId) external onlySlasher whenNotPaused nonReentrant {
++    frozenAuthors[authorProfileId] = true;
++    emit Frozen(authorProfileId, true);
++  }
++
++  /**
++   * @notice Unfreezes an author's vouches, allowing withdrawals again
++   * @dev Only callable by the authorized slasher contract
++   * @param authorProfileId The profile ID whose vouches will be unfrozen
++   */
++  function unfreeze(uint256 authorProfileId) external onlySlasher whenNotPaused nonReentrant {
++    frozenAuthors[authorProfileId] = false;
++    emit Frozen(authorProfileId, false);
++  }
++
+   /**
+    * @notice Reduces all vouch balances for a given author by a percentage
+    * @param authorProfileId The profile ID whose vouches will be slashed
+@@ -664,65 +813,119 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+ 
+   // --- Reward Functions ---
+ 
++  /**
++   * @notice Claims accumulated rewards for a verified Ethos profile
++   * @dev Combines rewards from both profile ID and address-based rewards
++   */
+   function claimRewards() external whenNotPaused nonReentrant {
+-    (bool verified, , bool mock, uint256 callerProfileId) = IEthosProfile(
+-      contractAddressManager.getContractAddressForName(ETHOS_PROFILE)
+-    ).profileStatusByAddress(msg.sender);
++    (bool verified, , bool mock, uint256 callerProfileId) = _ethosProfile().profileStatusByAddress(
++      msg.sender
++    );
+ 
+     // Only check that this is a real profile (not mock) and was verified at some point
+-    if (!verified || mock) {
+-      revert ProfileNotFoundForAddress(msg.sender);
+-    }
++    if (!verified || mock) revert ProfileNotFoundForAddress(msg.sender);
++
++    // claim rewards by profile id
++    uint256 amount = rewardsByProfileId[callerProfileId];
++
++    // claim rewards by address
++    uint256 addressRewards = rewardsByAddress[msg.sender];
++    amount += addressRewards;
+ 
+-    uint256 amount = rewards[callerProfileId];
+     if (amount == 0) revert InsufficientRewardsBalance();
+ 
+-    rewards[callerProfileId] = 0;
++    rewardsByProfileId[callerProfileId] = 0;
++    rewardsByAddress[msg.sender] = 0;
+     (bool success, ) = msg.sender.call{ value: amount }("");
+     if (!success) revert FeeTransferFailed("Rewards claim failed");
+ 
+     emit WithdrawnFromRewards(callerProfileId, amount);
+   }
+ 
+-  function _depositRewards(uint256 amount, uint256 recipientProfileId) internal {
+-    rewards[recipientProfileId] += amount;
+-    emit DepositedToRewards(recipientProfileId, amount);
+-  }
+-
+   /**
+-   * @notice Distributes rewards to previous vouchers proportionally based on their current balance
+-   * @param amount The amount to distribute as rewards
+-   * @param subjectProfileId The profile ID whose vouchers will receive rewards
++   * @notice Claims accumulated rewards for a profile using their attestation hash
++   * @dev Only for verified profiles that registered the attestation hash
++   * @param attestationHash The attestation hash used to identify the rewards
+    */
+-  function _rewardPreviousVouchers(
++  function claimRewardsByAttestation(bytes32 attestationHash) external whenNotPaused nonReentrant {
++    (bool verified, , bool mock, uint256 callerProfileId) = _ethosProfile().profileStatusByAddress(
++      msg.sender
++    );
++    if (!verified) revert ProfileNotFoundForAddress(msg.sender);
++    if (mock) revert ProfileNotFoundForAddress(msg.sender);
++
++    // ensure this hash belongs to the caller
++    if (_ethosProfile().profileIdByAttestation(attestationHash) != callerProfileId)
++      revert InvalidAttestationHash(attestationHash);
++
++    uint256 amount = rewardsByAttestationHash[attestationHash];
++    if (amount == 0) revert InsufficientRewardsBalance();
++
++    rewardsByAttestationHash[attestationHash] = 0;
++    (bool success, ) = msg.sender.call{ value: amount }("");
++    if (!success) revert FeeTransferFailed("Rewards claim failed");
++
++    emit WithdrawnFromRewards(callerProfileId, amount);
++  }
++
++  function _depositRewards(
+     uint256 amount,
+-    uint256 subjectProfileId
+-  ) internal returns (uint256 amountDistributed) {
++    uint256 recipientProfileId,
++    bytes32 attestationHash,
++    address subjectAddress
++  ) internal {
++    if (attestationHash != bytes32(0)) {
++      rewardsByAttestationHash[attestationHash] += amount;
++    } else if (subjectAddress != address(0)) {
++      rewardsByAddress[subjectAddress] += amount;
++    } else {
++      rewardsByProfileId[recipientProfileId] += amount;
++    }
++    emit DepositedToRewards(recipientProfileId, amount);
++  }
++
++  function _previousVouchersBalance(
++    uint256 subjectProfileId,
++    uint256 excludeAuthorId
++  ) internal view returns (uint256 totalBalance) {
+     uint256[] storage vouchIds = vouchIdsForSubjectProfileId[subjectProfileId];
+     uint256 totalVouches = vouchIds.length;
+ 
+-    // Calculate total balance of all active vouches
+-    uint256 totalBalance;
++    // Calculate total balance of all active vouches except author's
+     for (uint256 i = 0; i < totalVouches; i++) {
+       Vouch storage vouch = vouches[vouchIds[i]];
+-      // Only include active (not archived) vouches in the distribution
+-      if (!vouch.archived) {
++      // Only include active (not archived) vouches from other authors
++      if (!vouch.archived && vouch.authorProfileId != excludeAuthorId) {
+         totalBalance += vouch.balance;
+       }
+     }
++  }
+ 
+-    // If this is the first voucher, do not distribute rewards
+-    if (totalBalance == 0) {
+-      return totalBalance;
+-    }
+-
++  function _rewardPreviousVouchers(
++    uint256 amountToDistribute,
++    uint256 previousVouchersBalance,
++    uint256 subjectProfileId,
++    uint256 excludeAuthorId,
++    bytes32 attestationHash,
++    address subjectAddress
++  ) internal {
++    uint256[] storage vouchIds = vouchIdsForSubjectProfileId[subjectProfileId];
++    uint256 totalVouches = vouchIds.length;
+     // Distribute rewards proportionally
+-    uint256 remainingRewards = amount;
++    uint256 remainingRewards = amountToDistribute;
+     for (uint256 i = 0; i < totalVouches && remainingRewards > 0; i++) {
+       Vouch storage vouch = vouches[vouchIds[i]];
+-      if (!vouch.archived) {
++      if (!vouch.archived && vouch.authorProfileId != excludeAuthorId) {
+         // Calculate this vouch's share of the rewards
+-        uint256 reward = amount.mulDiv(vouch.balance, totalBalance, Math.Rounding.Floor);
++        uint256 reward = amountToDistribute.mulDiv(
++          vouch.balance,
++          previousVouchersBalance,
++          Math.Rounding.Floor
++        );
++        // Avoid rewarding the author more than the amount they vouched
++        // this prevents vouchers from vouching everyone for dust, just to try to get the total real vouch rewards
++        reward = Math.min(reward, vouch.balance);
++
+         if (reward > 0) {
+           vouch.balance += reward;
+           remainingRewards -= reward;
+@@ -730,12 +933,10 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+       }
+     }
+ 
+-    // Send any dust (remaining rewards due to rounding) to the subject reward escrow
++    // Send any remaining rewards to the subject reward escrow
+     if (remainingRewards > 0) {
+-      _depositRewards(remainingRewards, subjectProfileId);
++      _depositRewards(remainingRewards, subjectProfileId, attestationHash, subjectAddress);
+     }
+-
+-    return amount;
+   }
+ 
+   // --- View Functions ---
+@@ -787,9 +988,7 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+     uint256 author,
+     address subjectAddress
+   ) external view returns (Vouch memory) {
+-    address ethosProfile = contractAddressManager.getContractAddressForName(ETHOS_PROFILE);
+-
+-    uint256 profileId = IEthosProfile(ethosProfile).verifiedProfileIdForAddress(subjectAddress);
++    uint256 profileId = _ethosProfile().verifiedProfileIdForAddress(subjectAddress);
+ 
+     return verifiedVouchByAuthorForSubjectProfileId(author, profileId);
+   }
+@@ -918,50 +1117,69 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+     }
+   }
+ 
+-  /**
+-   * @notice Applies protocol, donation, and vouchers pool fees to a transaction amount
+-   * @param amount The amount to apply fees to
+-   * @param isEntry Whether this is an entry (true) or exit (false) transaction
+-   * @param subjectProfileId The profile ID receiving donation/rewards
+-   * @return toDeposit The amount to deposit after fees
+-   * @return totalFees The total amount of fees deducted
+-   */
+-  function applyFees(
++  function applyEntryFees(
+     uint256 amount,
+-    bool isEntry,
+-    uint256 subjectProfileId
++    uint256 subjectProfileId,
++    uint256 authorProfileId,
++    bytes32 attestationHash,
++    address subjectAddress
+   ) internal returns (uint256 toDeposit, uint256 totalFees) {
+-    if (isEntry) {
+-      // Calculate entry fees
+-      uint256 protocolFee = calcFee(amount, entryProtocolFeeBasisPoints);
+-      uint256 donationFee = calcFee(amount, entryDonationFeeBasisPoints);
+-      uint256 vouchersPoolFee = calcFee(amount, entryVouchersPoolFeeBasisPoints);
+-
+-      // Distribute fees
+-      if (protocolFee > 0) {
+-        _depositProtocolFee(protocolFee);
+-      }
+-      if (donationFee > 0) {
+-        _depositRewards(donationFee, subjectProfileId);
+-      }
+-      if (vouchersPoolFee > 0) {
+-        // update the voucher pool fee to the amount actually distributed
+-        vouchersPoolFee = _rewardPreviousVouchers(vouchersPoolFee, subjectProfileId);
+-      }
+-      totalFees = protocolFee + donationFee + vouchersPoolFee;
+-      toDeposit = amount - totalFees;
+-    } else {
+-      // Calculate and apply exit fee
+-      uint256 exitFee = calcFee(amount, exitFeeBasisPoints);
++    uint256 previousVouchersBalance = _previousVouchersBalance(subjectProfileId, authorProfileId);
++    // Sum all entry fees to calculate a max fee to be split across each fee type
++    uint256 totalFeesBasisPoints = entryProtocolFeeBasisPoints + entryDonationFeeBasisPoints;
++    if (previousVouchersBalance > 0) totalFeesBasisPoints += entryVouchersPoolFeeBasisPoints;
++    if (totalFeesBasisPoints == 0) return (amount, 0);
++
++    // Calculate deposit amount
++    toDeposit = amount.mulDiv(
++      BASIS_POINT_SCALE,
++      (BASIS_POINT_SCALE + totalFeesBasisPoints),
++      Math.Rounding.Floor
++    );
+ 
+-      if (exitFee > 0) {
+-        _depositProtocolFee(exitFee);
+-      }
+-      totalFees = exitFee;
+-      toDeposit = amount - exitFee;
+-    }
++    // Calculate total fees as the remainder
++    totalFees = amount - toDeposit;
+ 
+-    return (toDeposit, totalFees);
++    // Distribute total fees proportionally
++    uint256 protocolFee = totalFees.mulDiv(
++      entryProtocolFeeBasisPoints,
++      totalFeesBasisPoints,
++      Math.Rounding.Floor
++    );
++    uint256 donationFee = totalFees.mulDiv(
++      entryDonationFeeBasisPoints,
++      totalFeesBasisPoints,
++      Math.Rounding.Floor
++    );
++    uint256 vouchersPoolFee = totalFees - protocolFee - donationFee;
++
++    // Distribute each fee portion to its respective destination
++    if (protocolFee > 0) _depositProtocolFee(protocolFee);
++
++    if (donationFee > 0)
++      _depositRewards(donationFee, subjectProfileId, attestationHash, subjectAddress);
++
++    if (vouchersPoolFee > 0)
++      _rewardPreviousVouchers(
++        vouchersPoolFee,
++        previousVouchersBalance,
++        subjectProfileId,
++        authorProfileId,
++        attestationHash,
++        subjectAddress
++      );
++
++    // vouchersPoolFee is dynamic and may be less than initially allocated
++    // so we need to recalculate totalFees to ensure the correct amount is deposited
++    totalFees = protocolFee + donationFee + vouchersPoolFee;
++    toDeposit = amount - totalFees;
++  }
++
++  function applyExitFees(uint256 amount) internal returns (uint256 toDeposit, uint256 totalFees) {
++    // Exit transactions only have a single protocol fee
++    totalFees = calcFee(amount, exitFeeBasisPoints);
++    if (totalFees > 0) _depositProtocolFee(totalFees);
++    toDeposit = amount - totalFees;
+   }
+ 
+   /**
+@@ -1037,4 +1255,8 @@ contract EthosVouch is AccessControl, UUPSUpgradeable, ITargetStatus, Reentrancy
+     // the author->subject mapping is only for active vouches; remove it
+     delete vouchIdByAuthorForSubjectProfileId[v.authorProfileId][v.subjectProfileId];
+   }
++
++  function _ethosProfile() internal view returns (IEthosProfile) {
++    return IEthosProfile(contractAddressManager.getContractAddressForName(ETHOS_PROFILE));
++  }
+ }

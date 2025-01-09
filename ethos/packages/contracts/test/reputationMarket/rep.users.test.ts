@@ -37,7 +37,7 @@ describe('ReputationMarket Users', () => {
     await reputationMarket
       .connect(deployer.ADMIN)
       .createMarketWithConfigAdmin(marketUser.signer.address, 0, {
-        value: DEFAULT.initialLiquidity,
+        value: DEFAULT.creationCost,
       });
   });
 
@@ -102,12 +102,12 @@ describe('ReputationMarket Users', () => {
     await reputationMarket
       .connect(deployer.ADMIN)
       .createMarketWithConfigAdmin(marketUser1.signer.address, 0, {
-        value: DEFAULT.initialLiquidity,
+        value: DEFAULT.creationCost,
       });
     await reputationMarket
       .connect(deployer.ADMIN)
       .createMarketWithConfigAdmin(marketUser2.signer.address, 0, {
-        value: DEFAULT.initialLiquidity,
+        value: DEFAULT.creationCost,
       });
     const marketId1 = { profileId: markets.profileId1.profileId };
     const marketId2 = { profileId: markets.profileId2.profileId };

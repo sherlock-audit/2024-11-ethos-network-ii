@@ -2,7 +2,7 @@ import { type HardhatEthersSigner } from '@nomicfoundation/hardhat-ethers/signer
 import { time } from '@nomicfoundation/hardhat-toolbox/network-helpers.js';
 import { type ContractTransactionResponse } from 'ethers';
 import hre from 'hardhat';
-import { zeroAddress } from 'viem';
+import { zeroAddress, zeroHash } from 'viem';
 import { type IEthosProfile } from '../../typechain-types/index.js';
 import { common } from './common.js';
 import {
@@ -98,7 +98,7 @@ export class EthosUser {
   }
 
   public async getRewardsBalance(): Promise<bigint> {
-    return await this.deployer.ethosVouch.contract?.rewards(this.profileId);
+    return await this.deployer.ethosVouch.contract?.rewardsByProfileId(this.profileId);
   }
 
   public async grantInvites(amount: number): Promise<ContractTransactionResponse> {
@@ -137,5 +137,57 @@ export class EthosUser {
     return await this.deployer.ethosProfile.contract
       ?.connect(this.signer)
       .registerAddress(address, this.profileId, randValue, signature);
+  }
+
+  public async deleteAddress(
+    address: string,
+    markAsCompromised = false,
+  ): Promise<ContractTransactionResponse> {
+    return await this.deployer.ethosProfile.contract
+      ?.connect(this.signer)
+      .deleteAddress(address, markAsCompromised);
+  }
+
+  public async attest(
+    params: {
+      service?: string;
+      account?: string;
+      evidence?: string;
+    } = {},
+  ): Promise<string> {
+    const randValue = Math.floor(Math.random() * 1000000);
+    const evidence = params.evidence ?? DEFAULT.ATTESTATION_EVIDENCE;
+    const attestationDetails = {
+      service: params.service ?? DEFAULT.SERVICE_X,
+      account: params.account ?? DEFAULT.ACCOUNT_NAME_EXAMPLE,
+    };
+
+    const signature = await common.signatureForCreateAttestation(
+      this.profileId.toString(),
+      randValue.toString(),
+      attestationDetails.account,
+      attestationDetails.service,
+      evidence,
+      this.deployer.EXPECTED_SIGNER,
+    );
+
+    await this.deployer.ethosAttestation.contract
+      ?.connect(this.signer)
+      .createAttestation(this.profileId, randValue, attestationDetails, evidence, signature);
+
+    return await this.getAttestationHash(attestationDetails.service, attestationDetails.account);
+  }
+
+  public async getAttestationHash(service: string, account: string): Promise<string> {
+    return await this.deployer.ethosAttestation.contract.getServiceAndAccountHash(service, account);
+  }
+
+  public async increaseVouch(
+    vouchId: bigint,
+    params: { paymentAmount: bigint } = { paymentAmount: VOUCH_PARAMS.paymentAmount },
+  ): Promise<ContractTransactionResponse> {
+    return await this.deployer.ethosVouch.contract
+      ?.connect(this.signer)
+      .increaseVouch(vouchId, zeroHash, zeroAddress, { value: params.paymentAmount });
   }
 }

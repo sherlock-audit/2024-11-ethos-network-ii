@@ -1,7 +1,7 @@
 import { loadFixture } from '@nomicfoundation/hardhat-toolbox/network-helpers.js';
 import { expect } from 'chai';
 import hre from 'hardhat';
-import { calculateFee } from '../utils/common.js';
+import { calcFeeDistribution, calculateFee } from '../utils/common.js';
 import { DEFAULT, MAX_TOTAL_FEES } from '../utils/defaults.js';
 import { createDeployer, type EthosDeployer } from '../utils/deployEthos.js';
 import { type EthosUser } from '../utils/ethosUser.js';
@@ -44,7 +44,7 @@ async function setupFees(deployer: EthosDeployer): Promise<void> {
   );
 }
 
-describe('Vault Fees', () => {
+describe('Vouch Fees', () => {
   let deployer: EthosDeployer;
   let userA: EthosUser;
   let userB: EthosUser;
@@ -100,15 +100,17 @@ describe('Vault Fees', () => {
 
   it('should apply all fees', async () => {
     await setupFees(deployer);
+
+    // Calculate fees for initial vouch
+    const { deposit: initialDeposit } = calcFeeDistribution(paymentAmount, {
+      entry: entryFee,
+      donation: donationFee,
+      vouchIncentives: 0n,
+    });
+
     const { vouchId } = await userA.vouch(userB);
     const balance = await userA.getVouchBalance(vouchId);
-
-    const entryFeeAmount = calculateFee(paymentAmount, entryFee).fee;
-    const donationFeeAmount = calculateFee(paymentAmount, donationFee).fee;
-    const totalFees = entryFeeAmount + donationFeeAmount;
-    const expected = paymentAmount - totalFees;
-    expect(balance).to.be.closeTo(expected, 1);
-
+    expect(balance).to.be.closeTo(initialDeposit, 2n);
     const balanceBeforeUnvouch = await userA.getBalance();
     const unvouchTx = await userA.unvouch(vouchId);
     const receipt = await unvouchTx.wait();
@@ -120,9 +122,10 @@ describe('Vault Fees', () => {
     const transactionFee = receipt.gasUsed * receipt.gasPrice;
     const balanceAfterUnvouch = await userA.getBalance();
     const amountReceived = balanceAfterUnvouch - balanceBeforeUnvouch + transactionFee;
-    const exitFeeAmount = calculateFee(balance, exitFee).fee;
-    const expectedAfterExit = balance - exitFeeAmount;
-    expect(amountReceived).to.be.closeTo(expectedAfterExit, 1);
+
+    // Calculate exit fee on the vouch balance
+    const { deposit: expectedAfterExit } = calculateFee(balance, exitFee);
+    expect(amountReceived).to.be.closeTo(expectedAfterExit, 1n);
   });
 
   it('should allow changing the entry fee basis points', async () => {
@@ -389,6 +392,280 @@ describe('Vault Fees', () => {
         .connect(deployer.OWNER)
         .upgradeToAndCall(ethers.ZeroAddress, '0x'),
     ).to.be.revertedWithCustomError(deployer.ethosVouch.contract, 'ZeroAddress');
+  });
+
+  it('should handle vouchers pool fees correctly for first and subsequent vouches', async () => {
+    // Set up fees
+    const protocolFee = 400n; // 4%
+    const donationFee = 300n; // 3%
+    const vouchersPoolFee = 200n; // 2%
+
+    await Promise.all([
+      deployer.ethosVouch.contract
+        .connect(deployer.ADMIN)
+        .setEntryProtocolFeeBasisPoints(protocolFee),
+      deployer.ethosVouch.contract
+        .connect(deployer.ADMIN)
+        .setEntryDonationFeeBasisPoints(donationFee),
+      deployer.ethosVouch.contract
+        .connect(deployer.ADMIN)
+        .setEntryVouchersPoolFeeBasisPoints(vouchersPoolFee),
+    ]);
+
+    const vouchAmount = ethers.parseEther('1.0');
+    const BASIS_POINTS = 10000n;
+
+    // Set high balances to avoid insufficient funds
+    await userA.setBalance(ethers.parseEther('1000.0').toString());
+    await userB.setBalance(ethers.parseEther('1000.0').toString());
+
+    // Calculate total fees first
+    const firstVouchFeeBasisPoints = donationFee + protocolFee;
+    const firstVouchFees =
+      vouchAmount - (vouchAmount * BASIS_POINTS) / (BASIS_POINTS + firstVouchFeeBasisPoints);
+
+    // Calculate individual fee shares
+    const firstVouchDonationShare = (firstVouchFees * donationFee) / firstVouchFeeBasisPoints;
+
+    // Track initial rewards
+    const initialUserBRewards = await userB.getRewardsBalance();
+
+    // Make first vouch
+    const { vouchId: firstVouchId } = await userA.vouch(userB, { paymentAmount: vouchAmount });
+
+    // Check rewards after first vouch
+    const afterFirstVouchRewards = await userB.getRewardsBalance();
+    const rewardsIncrease = afterFirstVouchRewards - initialUserBRewards;
+
+    // For first vouch, only donation fee goes to rewards
+    expect(rewardsIncrease).to.be.closeTo(firstVouchDonationShare, 1n);
+
+    // Second vouch
+    const userC = await deployer.createUser();
+    await userC.setBalance(ethers.parseEther('1000.0').toString());
+    const secondVouchBasisPoints = donationFee + protocolFee + vouchersPoolFee;
+    const secondVouchFees =
+      vouchAmount - (vouchAmount * BASIS_POINTS) / (BASIS_POINTS + secondVouchBasisPoints);
+    const secondVouchVouchersPoolShare =
+      (secondVouchFees * vouchersPoolFee) / secondVouchBasisPoints;
+
+    // Track first voucher's balance before second vouch
+    const beforeSecondVouchBalance = await userA.getVouchBalance(firstVouchId);
+
+    // Make second vouch
+    const { vouchId: secondVouchId } = await userC.vouch(userB, { paymentAmount: vouchAmount });
+    const secondVouchBalance = await userA.getVouchBalance(secondVouchId);
+
+    // Check first voucher's balance after second vouch
+    const afterSecondVouchBalance = await userA.getVouchBalance(firstVouchId);
+    const voucherBalanceIncrease = afterSecondVouchBalance - beforeSecondVouchBalance;
+
+    // Third vouch
+    const userD = await deployer.createUser();
+    await userD.setBalance(ethers.parseEther('1000.0').toString());
+    const { vouchId: thirdVouchId } = await userD.vouch(userB, { paymentAmount: vouchAmount });
+    const thirdVouchBalance = await userA.getVouchBalance(thirdVouchId);
+
+    // First voucher should receive the vouchers pool fee from second vouch (allow 1 wei difference)
+    expect(voucherBalanceIncrease).to.be.closeTo(secondVouchVouchersPoolShare, 1n);
+    // First vouch balance should be greater than second vouch balance
+    expect(beforeSecondVouchBalance).to.gt(secondVouchBalance);
+    // All the consequent vouches should have the same balance
+    expect(secondVouchBalance).to.equal(thirdVouchBalance);
+  });
+
+  it('should limit voucher rewards to their vouch amount when they are the only voucher', async () => {
+    // Set up a scenario where vouchers pool fee is high
+    const vouchersPoolFee = 1000n; // 10% - maximum allowed fee
+    await deployer.ethosVouch.contract
+      .connect(deployer.ADMIN)
+      .setEntryVouchersPoolFeeBasisPoints(vouchersPoolFee);
+
+    // First vouch - small amount
+    const smallVouchAmount = paymentAmount; // Use default payment amount
+    await userA.setBalance((paymentAmount * 10n).toString());
+    const { vouchId: firstVouchId } = await userA.vouch(userB, { paymentAmount: smallVouchAmount });
+
+    // Second vouch - large amount (100x first vouch)
+    const largeVouchAmount = paymentAmount * 1000n;
+    const userC = await deployer.createUser();
+    await userC.setBalance((largeVouchAmount * 2n).toString());
+
+    // Get userA's vouch balance before second vouch
+    const balanceBeforeSecondVouch = await userA.getVouchBalance(firstVouchId);
+
+    // Make second vouch
+    await userC.vouch(userB, { paymentAmount: largeVouchAmount });
+
+    // Get userA's vouch balance after second vouch
+    const balanceAfterSecondVouch = await userA.getVouchBalance(firstVouchId);
+    const rewardAmount = balanceAfterSecondVouch - balanceBeforeSecondVouch;
+
+    // The reward should not exceed the original vouch amount
+    expect(rewardAmount).to.be.lte(smallVouchAmount);
+  });
+
+  it('should limit voucher rewards when there are multiple eligible vouchers', async () => {
+    // Set up a scenario where vouchers pool fee is high
+    const vouchersPoolFee = 1000n; // 10% - maximum allowed fee
+    await deployer.ethosVouch.contract
+      .connect(deployer.ADMIN)
+      .setEntryVouchersPoolFeeBasisPoints(vouchersPoolFee);
+
+    // Third vouch - large amount (1000x initial vouch)
+    const largeVouchAmount = paymentAmount * 1000n;
+    const userD = await deployer.createUser();
+
+    // First two vouches - equal amounts
+    const initialVouchAmount = paymentAmount;
+    await Promise.all([
+      userA.setBalance((paymentAmount * 20n).toString()),
+      userB.setBalance((paymentAmount * 20n).toString()),
+      userD.setBalance((largeVouchAmount * 20n).toString()),
+    ]);
+
+    const userC = await deployer.createUser();
+    const { vouchId: firstVouchId } = await userA.vouch(userC, {
+      paymentAmount: initialVouchAmount,
+    });
+    const { vouchId: secondVouchId } = await userB.vouch(userC, {
+      paymentAmount: initialVouchAmount,
+    });
+
+    // Get balances before third vouch
+    const [firstVoucherInitialBalance, secondVoucherInitialBalance] = await Promise.all([
+      userA.getVouchBalance(firstVouchId),
+      userB.getVouchBalance(secondVouchId),
+    ]);
+
+    // Make third vouch
+    await userD.vouch(userC, { paymentAmount: largeVouchAmount });
+
+    // Get balances after third vouch
+    const [firstVoucherFinalBalance, secondVoucherFinalBalance] = await Promise.all([
+      userA.getVouchBalance(firstVouchId),
+      userB.getVouchBalance(secondVouchId),
+    ]);
+
+    // Calculate rewards for each voucher explicitly
+    const rewardsForFirstVoucher = firstVoucherFinalBalance - firstVoucherInitialBalance;
+    const rewardsForSecondVoucher = secondVoucherFinalBalance - secondVoucherInitialBalance;
+    // The rewards don't exceed the original vouch amount since there are multiple vouchers
+    expect(rewardsForFirstVoucher).to.be.lte(
+      firstVoucherInitialBalance,
+      'Rewards for first voucher should be less than or equal to the vouch amount',
+    );
+    expect(rewardsForSecondVoucher).to.be.lte(
+      firstVoucherInitialBalance,
+      'Rewards for second voucher should be less than or equal to the vouch amount',
+    );
+  });
+
+  it('should not deduct vouchers pool fee when there are no previous vouchers', async () => {
+    // Set up fees - only vouchers pool fee
+    const vouchersPoolFee = 500n; // 5%
+    await deployer.ethosVouch.contract
+      .connect(deployer.ADMIN)
+      .setEntryVouchersPoolFeeBasisPoints(vouchersPoolFee);
+
+    // Clear other fees to isolate the issue
+    await Promise.all([
+      deployer.ethosVouch.contract.connect(deployer.ADMIN).setEntryProtocolFeeBasisPoints(0n),
+      deployer.ethosVouch.contract.connect(deployer.ADMIN).setEntryDonationFeeBasisPoints(0n),
+    ]);
+
+    const vouchAmount = ethers.parseEther('1.0');
+    // Convert to string without decimal points
+    await userA.setBalance(vouchAmount.toString());
+
+    // First vouch - should not deduct vouchers pool fee since there are no previous vouchers
+    const initialBalance = await userA.getBalance();
+    const vouchTx = await userA.deployer.ethosVouch.contract
+      .connect(userA.signer)
+      .vouchByProfileId(userB.profileId, DEFAULT.COMMENT, DEFAULT.METADATA, { value: vouchAmount });
+    const receipt = await vouchTx.wait();
+
+    if (!receipt) {
+      expect.fail('Transaction receipt not found');
+    }
+
+    // Get transaction cost
+    const gasCost = receipt.gasUsed * receipt.gasPrice;
+
+    // Get the vouch details
+    const vouch = await userA.deployer.ethosVouch.contract.verifiedVouchByAuthorForSubjectProfileId(
+      userA.profileId,
+      userB.profileId,
+    );
+
+    // Check vouch balance
+    const vouchBalance = await userA.getVouchBalance(vouch.vouchId);
+
+    // Expected: full amount minus gas (no fees since there were no previous vouchers)
+    expect(vouchBalance).to.equal(vouchAmount, 'Vouch balance should be the full amount');
+
+    // Verify user's ETH balance reflects this
+    const finalBalance = await userA.getBalance();
+    const expectedFinalBalance = initialBalance - vouchAmount - gasCost;
+    expect(finalBalance).to.equal(expectedFinalBalance, 'User balance should reflect the vouch');
+  });
+
+  it('should correctly calculate all fees for initial vouch of 1 ETH times total fee percentage', async () => {
+    // Set up all fees
+    await setupFees(deployer);
+
+    // Calculate total amount needed using basis points (10000 = 100%)
+    const BASIS_POINTS = 10000n;
+    const totalFeeBasisPoints = entryFee + donationFee; // omit vouchIncentives because there's no previous vouchers
+    const oneEth = ethers.parseEther('1.0');
+    const vouchAmount = (oneEth * (BASIS_POINTS + totalFeeBasisPoints)) / BASIS_POINTS;
+
+    await userA.setBalance((vouchAmount * 2n).toString());
+    const protocolBalance = await ethers.provider.getBalance(
+      await deployer.ethosVouch.contract.protocolFeeAddress(),
+    );
+
+    // Calculate expected fee distribution
+    const { deposit: expectedDeposit, shares } = calcFeeDistribution(vouchAmount, {
+      entry: entryFee,
+      donation: donationFee,
+      vouchIncentives: 0n,
+    });
+    expect(expectedDeposit).to.equal(oneEth, 'Expected deposit should be 1 ETH');
+
+    // Get initial balances
+    const initialProtocolBalance = await ethers.provider.getBalance(
+      await deployer.ethosVouch.contract.protocolFeeAddress(),
+    );
+    const initialRecipientRewards = await userB.getRewardsBalance();
+
+    // Perform vouch
+    const { vouchId } = await userA.vouch(userB, { paymentAmount: vouchAmount });
+
+    // Get final balances
+    const [vouchBalance, recipientRewards, protocolFeeBalance] = await Promise.all([
+      userA.getVouchBalance(vouchId),
+      userB.getRewardsBalance(),
+      ethers.provider.getBalance(await deployer.ethosVouch.contract.protocolFeeAddress()),
+    ]);
+
+    // Calculate actual fees paid
+    const actualProtocolFee = protocolFeeBalance - initialProtocolBalance;
+    const actualDonationFee = recipientRewards - initialRecipientRewards;
+    expect(actualProtocolFee).to.equal(shares.protocol, 'Protocol fee matches calculation');
+    expect(actualDonationFee).to.equal(shares.donation, 'Donation fee matches calculation');
+
+    // Vouch balance should be deposit amount (no vouchers pool fee since it's first vouch)
+    expect(vouchBalance).to.equal(oneEth, 'Vouch balance should be 1 ETH');
+
+    // Recipient should receive donation fee
+    expect(recipientRewards).to.equal(shares.donation, 'Recipient rewards should be donation fee');
+
+    // Protocol fee address should receive protocol fee
+    expect(protocolFeeBalance - protocolBalance).to.equal(
+      shares.protocol,
+      'Protocol fee matches calculation',
+    );
   });
 
   async function getTotalFees(): Promise<bigint> {

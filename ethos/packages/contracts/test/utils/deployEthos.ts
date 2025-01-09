@@ -1,5 +1,4 @@
 import { type HardhatEthersSigner } from '@nomicfoundation/hardhat-ethers/signers.js';
-import { type ContractFactory, type BaseContract } from 'ethers';
 import hre from 'hardhat';
 
 import {
@@ -15,12 +14,14 @@ import {
   type RejectETHReceiver,
   type SignatureVerifier,
   type ReputationMarket,
+  type LMSR,
 } from '../../typechain-types/index.js';
 import { EthosUser } from './ethosUser.js';
 import { smartContractNames } from './mock.names.js';
 
 const { ethers } = hre;
-
+type ContractFactory = Awaited<ReturnType<typeof hre.ethers.getContractFactory>>;
+type BaseContract = Awaited<ReturnType<ContractFactory['deploy']>>;
 type Deployable<T> = {
   contract: T;
   address: string;
@@ -59,6 +60,7 @@ export class EthosDeployer {
   public readonly rejectETHReceiver!: Deployable<RejectETHReceiver>;
   public readonly paymentTokens: Array<Deployable<PaymentToken>> = [];
   public readonly reputationMarket!: Proxied<ReputationMarket>;
+  public readonly lmsrLibrary!: Deployable<LMSR>;
 
   constructor() {
     // this is stupid - just setting these to undefined
@@ -86,6 +88,8 @@ export class EthosDeployer {
     this.rejectETHReceiver = {} as Deployable<RejectETHReceiver>;
     // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
     this.reputationMarket = {} as Proxied<ReputationMarket>;
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+    this.lmsrLibrary = {} as Deployable<LMSR>;
   }
 
   /**
@@ -100,14 +104,17 @@ export class EthosDeployer {
     this.EXPECTED_SIGNER = signers[2];
     this.FEE_PROTOCOL_ACC = signers[3];
     this.RANDOM_ACC = signers[4];
-    // no dependencies
+
+    // Deploy all contracts with no dependencies in parallel
     await Promise.all([
+      this.deployLMSRLibrary(),
       this.deployProxy(),
       this.deployContractAddressManager(),
       this.deploySignatureVerifier(),
       this.deployRejectETHReceiver(),
       this.deployPaymentToken(),
     ]);
+
     // depends on contractAddressManager
     await this.deployInteractionControl();
     // depends on signatureVerifier, contractAddressManager
@@ -331,13 +338,33 @@ export class EthosDeployer {
   }
 
   /**
+   * Deploys the LMSR library contract.
+   * (no dependencies on other contracts)
+   */
+  private async deployLMSRLibrary(): Promise<void> {
+    this.lmsrLibrary.contract = await ethers.deployContract('LMSR');
+    this.lmsrLibrary.address = await this.lmsrLibrary.contract.getAddress();
+  }
+
+  /**
    * Deploys the ReputationMarket contract.
-   * (depends on signatureVerifier, contractAddressManager)
+   * (depends on signatureVerifier, contractAddressManager, and LMSR library)
    */
   async deployReputationMarket(): Promise<void> {
-    this.reputationMarket.factory = await ethers.getContractFactory('ReputationMarket');
-    this.reputationMarket.contract = await ethers.deployContract('ReputationMarket', []);
-    this.reputationMarket.address = await this.reputationMarket.contract.getAddress();
+    if (!this.lmsrLibrary.address) {
+      throw new Error('LMSR library not deployed');
+    }
+
+    this.reputationMarket.factory = await ethers.getContractFactory('ReputationMarket', {
+      libraries: {
+        'contracts/utils/LMSR.sol:LMSR': this.lmsrLibrary.address,
+      },
+    });
+
+    const implementation = await this.reputationMarket.factory.deploy();
+    await implementation.waitForDeployment();
+    this.reputationMarket.address = await implementation.getAddress();
+
     this.reputationMarket.proxy = await this.ERC1967Proxy.factory.deploy(
       this.reputationMarket.address,
       this.reputationMarket.factory.interface.encodeFunctionData('initialize', [
@@ -349,16 +376,11 @@ export class EthosDeployer {
       ]),
     );
     await this.reputationMarket.proxy.waitForDeployment();
-    this.reputationMarket.address = await this.reputationMarket.proxy.getAddress();
+    const proxyAddress = await this.reputationMarket.proxy.getAddress();
+    this.reputationMarket.address = proxyAddress;
 
-    if (this.reputationMarket.address) {
-      this.reputationMarket.contract = await ethers.getContractAt(
-        'ReputationMarket',
-        this.reputationMarket.address,
-      );
-    } else {
-      throw new Error('ReputationMarket address is undefined');
-    }
+    // Get the contract instance with the correct interface
+    this.reputationMarket.contract = await ethers.getContractAt('ReputationMarket', proxyAddress);
   }
 
   /**
